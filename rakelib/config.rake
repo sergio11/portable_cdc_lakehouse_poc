@@ -19,6 +19,53 @@ module Config
   IVY_CACHE_DIR    = "/root/.ivy2"
   SBT_CACHE_DIR    = "/root/.sbt"
   COURSIER_DIR     = "/root/.cache/coursier"
+
+  # --- Service images, pinned to exact tags (never `latest`) -----------------
+  # Verified against their registries; see docs/compatibility-matrix.md.
+  POSTGRES_IMAGE = "docker.io/library/postgres:17.2-bookworm"
+  KAFKA_IMAGE    = "docker.io/apache/kafka:3.9.1"
+  DEBEZIUM_IMAGE = "quay.io/debezium/connect:3.2.4.Final"
+  TRINO_IMAGE    = "docker.io/trinodb/trino:476"
+
+  # Iceberg warehouse. The path MUST be identical in every container that reads
+  # or writes Iceberg: HadoopCatalog addresses catalog metadata and data files
+  # by this location, so a per-service remap would break table resolution.
+  WAREHOUSE_PATH = "/warehouse"
+
+  ENV_FILE = File.join(ROOT, ".env")
+
+  # Parse the local .env into a Hash. Credentials stay on disk, never in Git.
+  def self.load_env!
+    @env ||= begin
+      unless File.exist?(ENV_FILE)
+        abort <<~MSG
+          Missing .env file.
+
+          Local credentials are kept out of version control (SRS NFR-005).
+          Create it once with:
+
+            cp .env.example .env
+
+          then adjust the values if needed.
+        MSG
+      end
+
+      File.readlines(ENV_FILE).filter_map do |line|
+        stripped = line.strip
+        next if stripped.empty? || stripped.start_with?("#")
+
+        key, value = stripped.split("=", 2)
+        [key.strip, value.to_s.strip]
+      end.to_h
+    end
+  end
+
+  # Read a configured value, failing with the key name rather than a nil error.
+  def self.pg(key)
+    value = load_env![key]
+    abort("Missing required setting #{key} in .env") if value.nil? || value.empty?
+    value
+  end
 end
 
 # Runs sbt inside the pinned container with the repo bind-mounted. The host needs

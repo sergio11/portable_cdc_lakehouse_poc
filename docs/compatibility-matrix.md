@@ -59,17 +59,58 @@ The pinned JDK 21 satisfies this.
 
 ## 3. Infrastructure services
 
-Tags are pinned by digest where the project depends on exact behaviour. No
+Every image tag below was verified against its registry before being pinned. No
 `latest` tags are permitted anywhere in the configuration.
 
-| Service | Version | Validation |
+| Service | Image / tag | Validation |
 |---|---|---|
-| PostgreSQL | 17 | Pending — Phase 1 |
-| Debezium PostgreSQL connector | 3.x | Pending — Phase 1 |
-| Kafka (KRaft) | 3.9.x / 4.x (tbd at Phase 1) | Pending — Phase 1 |
-| MinIO | release tag (tbd at Phase 1) | Pending — Phase 1 |
-| Iceberg REST catalog | 1.11.0 | Pending — Phase 1 |
-| DuckDB (query/inspection) | latest stable | Pending — Phase 1 |
+| PostgreSQL | `docker.io/library/postgres:17.2-bookworm` | Registry verified — runtime Pending (Phase 1) |
+| Kafka (KRaft, single node) | `docker.io/apache/kafka:3.9.1` | Registry verified — runtime Pending (Phase 1) |
+| Debezium / Connect | `docker.io/debezium/connect:3.2.4.Final` | Registry verified — runtime Pending (Phase 1) |
+| Trino (SQL inspection) | `docker.io/trinodb/trino:476` | Registry verified — runtime Pending (Phase 1) |
+| Apache Iceberg | 1.11.0 (via Beam) | Runtime Pending — Phase 3 |
+| Iceberg catalog | HadoopCatalog on shared volume | ADR-009 |
+| Object storage | Local filesystem volume | ADR-008 — MinIO withdrawn upstream |
+
+### Object storage: MinIO is no longer publishable
+
+The SRS specifies MinIO as the S3-compatible store. MinIO Inc. moved the
+community edition to a *source-only* distribution in October 2025 and withdrew
+the official images from Docker Hub and quay.io. Verified from this machine:
+
+- `docker.io/minio/minio` → **401 Unauthorized** for every tag
+- `quay.io/minio/minio` → pulls refused
+- Last published image: `RELEASE.2025-09-07T16-13-09Z`
+
+Third-party mirrors exist but were rejected as a supply-chain liability. The
+warehouse therefore uses a local filesystem volume with HadoopCatalog; see
+`docs/decisions/ADR-008-object-storage.md`.
+
+### Iceberg REST catalog: no published image
+
+A REST catalog was the preferred design, but no such image is published:
+
+- `apache/iceberg-rest` → does not exist
+- `apache/iceberg-rest-catalog` → does not exist
+- `tabularium/iceberg-rest-catalog` → does not exist
+
+HadoopCatalog is used instead, which is the path Beam's own `IcebergIO`
+documentation recommends for local development. See
+`docs/decisions/ADR-009-iceberg-catalog.md`.
+
+### Why Trino instead of DuckDB
+
+Trino's Iceberg connector supports the `hadoop` catalog type and the filesystem
+warehouse as first-class, documented configurations. DuckDB's Iceberg extension
+is less certain for a non-REST catalog, and the POC cannot launch containers to
+empirically validate that path, so the lower-risk engine was chosen.
+
+### Kafka addressing
+
+Kafka advertises only `kafka:9092` and is deliberately **not** published to the
+host. A single advertised address avoids the classic split where host clients and
+container clients need different values. The Beam application joins the
+`pcl_default` Compose network and uses the same address.
 
 ## 4. Known risk: Flink and the lz4 capability conflict
 

@@ -1,0 +1,35 @@
+{
+  "name": "pcl-postgres-orders",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "postgres",
+    "database.dbname": "__PCL_POSTGRES_DB__",
+    "database.password": "__PCL_POSTGRES_PASSWORD__",
+
+    "topic.prefix": "pcl",
+    "schema.include.list": "public",
+    "table.include.list": "public.orders",
+
+    "plugin.name": "pgoutput",
+    "publication.name": "pcl_publication",
+    "slot.name": "pcl_slot",
+
+    "snapshot.mode": "initial",
+    "tombstones.on.delete": "true",
+
+    "decimal.handling.mode": "string",
+    "time.precision.mode": "connect",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    "topic.creation.default.replication.factor": "1",
+    "topic.creation.default.partitions": "1"
+  }
+}

@@ -1,0 +1,130 @@
+# ---------------------------------------------------------------------------
+# Portable CDC Lakehouse — local lakehouse stack.
+#
+# Design notes
+#   * Every image is pinned to an exact tag. `latest` is never used, so a clean
+#     environment always resolves to the versions validated in
+#     docs/compatibility-matrix.md.
+#   * Networking is deliberately conservative. Kafka advertises only its
+#     in-network address (`kafka:9092`) and is NOT published to the host, so
+#     there is a single unambiguous address for clients. The Beam application
+#     joins this network and therefore uses the same value; publishing the port
+#     would force an advertised-listener split between host and container
+#     clients, which is a classic source of silent misconfiguration.
+#   * The Iceberg warehouse is a local filesystem managed by Iceberg's
+#     HadoopCatalog. It is mounted at the SAME path (/warehouse) in every
+#     container that touches it, because catalog metadata and data files are
+#     addressed by that path. Do not remap it per service.
+#   * Postgres runs with logical WAL decoding enabled for Debezium.
+#
+# Usage is always through Rake (`rake infra:up`), never by calling
+# `podman compose` by hand, so that readiness is awaited and errors are clear.
+# ---------------------------------------------------------------------------
+
+services:
+
+  postgres:
+    image: docker.io/library/postgres:17.2-bookworm
+    container_name: pcl-postgres
+    # Logical decoding is the mechanism Debezium reads from (SRS FR-001).
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    environment:
+      POSTGRES_DB: ${PCL_POSTGRES_DB}
+      POSTGRES_USER: ${PCL_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${PCL_POSTGRES_PASSWORD}
+      # Deterministic collation so fixture ordering does not depend on the host.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Source schema is applied once, on first initialisation of an empty volume.
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${PCL_POSTGRES_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PCL_POSTGRES_USER} -d ${PCL_POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  kafka:
+    image: docker.io/apache/kafka:3.9.1
+    container_name: pcl-kafka
+    # Single-node KRaft: this node is both broker and controller. Sufficient for
+    # a POC and avoids ZooKeeper entirely.
+    environment:
+      CLUSTER_ID: ${PCL_KAFKA_CLUSTER_ID}
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single node, so every replication factor collapses to 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      # Uses the image's own tooling: no shell interpolation tricks needed.
+      test:
+        - CMD-SHELL
+        - >-
+          /opt/kafka/bin/kafka-broker-api-versions.sh
+          --bootstrap-server localhost:9092 >/dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  connect:
+    image: quay.io/debezium/connect:3.2.4.Final
+    container_name: pcl-connect
+    depends_on:
+      - postgres
+      - kafka
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: pcl-connect-cluster
+      CONFIG_STORAGE_TOPIC: pcl_connect_configs
+      OFFSET_STORAGE_TOPIC: pcl_connect_offsets
+      STATUS_STORAGE_TOPIC: pcl_connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      # Debezium reads logical decoding from Postgres as this user.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+    ports:
+      - "127.0.0.1:${PCL_CONNECT_PORT}:8083"
+
+  trino:
+    image: docker.io/trinodb/trino:476
+    container_name: pcl-trino
+    volumes:
+      # Iceberg catalog definitions (Trino <-> Iceberg wiring).
+      - ./infra/trino/etc/catalog:/etc/trino/catalog:ro
+      # The Iceberg warehouse, at the identical path used by every other service.
+      - iceberg_warehouse:/warehouse
+      - trino_data:/var/lib/trino/data
+    ports:
+      - "127.0.0.1:${PCL_TRINO_PORT}:8080"
+
+volumes:
+  postgres_data:
+  kafka_data:
+  iceberg_warehouse:
+  trino_data:
