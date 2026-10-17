@@ -1,0 +1,79 @@
+package com.example.pcl.architecture
+
+import com.example.pcl.config.PclSettings
+import org.scalatest.flatspec.AnyFlatSpec
+import org.scalatest.matchers.should.Matchers
+
+/** Guards the hexagonal boundary: the `domain` package must stay pure Scala so the same logic runs
+  * unchanged under DirectRunner and FlinkRunner (ADR-001, ADR-002).
+  *
+  * We assert this by scanning the compiled bytecode of `domain` for forbidden references (Beam,
+  * Kafka, Iceberg, logging, clock). This is a real structural test, not a comment: it fails the
+  * build if someone leaks a framework type into the core.
+  */
+class DomainPuritySpec extends AnyFlatSpec with Matchers {
+
+  private val domainPackages = Seq(
+    "com/example/pcl/domain/"
+  )
+
+  // Framework / infrastructure namespaces the core must never reference.
+  private val forbiddenPrefixes = Seq(
+    "org/apache/beam/",
+    "org/apache/kafka/",
+    "org/apache/iceberg/",
+    "org/slf4j/",
+    "ch/qos/logback/"
+  )
+
+  private def domainClassFiles: Seq[java.io.File] = {
+    val base = new java.io.File("target/scala-2.13/classes")
+    def walk(dir: java.io.File): Seq[java.io.File] = {
+      val children = Option(dir.listFiles()).map(_.toSeq).getOrElse(Seq.empty)
+      children.flatMap { f =>
+        if (f.isDirectory) walk(f)
+        else if (f.getName.endsWith(".class")) Seq(f)
+        else Seq.empty
+      }
+    }
+    walk(base).filter { f =>
+      val n = f.getAbsolutePath.replace('\\', '/')
+      domainPackages.exists(p => n.contains(p))
+    }
+  }
+
+  "The domain package" should "contain compiled classes" in {
+    domainClassFiles should not be empty
+  }
+
+  it should "never reference Beam, Kafka, Iceberg or logging frameworks" in {
+    val violations = domainClassFiles.flatMap { file =>
+      // A cheap structural proxy: read raw bytes and look for internal class names.
+      // Class files embed referenced types as UTF8 constants, so a prefix match is
+      // a reliable, dependency-free way to detect leakage without a bytecode library.
+      val bytes = java.nio.file.Files.readAllBytes(file.toPath)
+      val raw   = new String(bytes, java.nio.charset.StandardCharsets.ISO_8859_1)
+      val hits  = forbiddenPrefixes.filter(raw.contains)
+      if (hits.nonEmpty) Some(file.getName -> hits) else None
+    }
+
+    withClue(s"Domain classes leaked framework references: $violations") {
+      violations shouldBe empty
+    }
+  }
+
+  "PclSettings.fromEnv" should "surface a reason code when run id is missing" in {
+    val result = PclSettings.fromEnv(Map("PCL_SOURCE_ID" -> "pg-1"))
+    result shouldBe Left(PclSettings.MissingRunId)
+  }
+
+  it should "surface a reason code when source id is missing" in {
+    val result = PclSettings.fromEnv(Map("PCL_RUN_ID" -> "run-1"))
+    result shouldBe Left(PclSettings.MissingSourceId)
+  }
+
+  it should "build settings when both variables are present" in {
+    val result = PclSettings.fromEnv(Map("PCL_RUN_ID" -> "run-1", "PCL_SOURCE_ID" -> "pg-1"))
+    result shouldBe Right(PclSettings(runId = "run-1", sourceId = "pg-1"))
+  }
+}

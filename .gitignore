@@ -1,0 +1,28 @@
+# --- JVM / sbt ---
+target/
+project/target/
+project/project/
+.bsp/
+.metals/
+.bloop/
+.scala-build/
+*.class
+*.log
+
+# --- Ruby / Rake ---
+vendor/bundle/
+.bundle/
+
+# --- Local env & secrets ---
+.env
+.env.*
+!.env.example
+
+# --- IDE ---
+.idea/
+.vscode/
+*.iml
+
+# --- OS ---
+.DS_Store
+Thumbs.db
