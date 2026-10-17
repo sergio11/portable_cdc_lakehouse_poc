@@ -1,0 +1,11 @@
+# Normalize line endings in the repository to LF.
+#
+# The working tree is bind-mounted into Linux containers, and scalafmt formats
+# to LF. Without this, a checkout on Windows rewrites sources to CRLF and the
+# format gate fails on every file. Pinning the line endings in the index keeps
+# the build deterministic across operating systems.
+* text=auto eol=lf
+
+# Windows cannot mark scripts as executable; keep it simple and portable.
+*.bat text eol=crlf
+*.cmd text eol=crlf

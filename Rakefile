@@ -15,11 +15,17 @@ def run!(*cmd, chdir: Config::ROOT)
   abort("Command failed: #{cmd.join(' ')}") unless success
 end
 
+# Each gate runs as a *single* container invocation. Starting sbt costs a full
+# JVM boot plus a project reload, so chaining tasks would pay that several times
+# over for no benefit; sbt accepts multiple commands in one batch run.
 desc "Run the full local gate: compile, format check, unit + architecture tests"
 task :verify do
-  Rake::Task["compile"].invoke
-  Rake::Task["scalafmt:check"].invoke
-  Rake::Task["test:unit"].invoke
+  Build.container_sbt(
+    "scalafmtCheckAll",
+    "compile",
+    "Test/compile",
+    Build.sbt_test_only(*Build::UNIT_TEST_PATTERNS)
+  )
 end
 
 desc "Compile main + test sources inside the pinned build container"
@@ -45,12 +51,12 @@ end
 namespace :test do
   desc "Run unit + architecture tests (fast, no external services)"
   task :unit do
-    Build.container_sbt("testOnly", "com.example.pcl.architecture.*", "com.example.pcl.domain.*")
+    Build.container_sbt(Build.sbt_test_only(*Build::UNIT_TEST_PATTERNS))
   end
 
   desc "Run integration tests (requires `rake infra:up`)"
   task :integration do
-    Build.container_sbt("testOnly", "com.example.pcl.integration.*")
+    Build.container_sbt(Build.sbt_test_only("com.example.pcl.integration.*"))
   end
 end
 

@@ -26,8 +26,22 @@ end
 module Build
   include Config
 
+  # Suites that make up the fast local gate: domain rules and the architectural
+  # boundary. Integration suites are deliberately excluded — they need services.
+  UNIT_TEST_PATTERNS = %w[
+    com.example.pcl.architecture.*
+    com.example.pcl.domain.*
+  ].freeze
+
   # sbt commands are passed as separate argv entries (never interpolated into a
   # shell string), so paths with spaces and metacharacters stay safe.
+
+  # Batch mode treats every argv entry as a distinct command, so a command with
+  # its own arguments must travel as ONE entry. Joining happens here rather than
+  # in the caller so no task can get the split wrong.
+  def self.sbt_test_only(*patterns)
+    "testOnly #{patterns.join(' ')}"
+  end
   def self.container_sbt(*sbt_args)
     argv = [
       "podman", "run", "--rm",
