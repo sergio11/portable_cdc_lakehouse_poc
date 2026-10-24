@@ -1,9 +1,18 @@
 # frozen_string_literal: true
 
 namespace :pipeline do
-  def run_pipeline(runner_args)
+  def run_pipeline(runner_args, flink_cluster: false)
     env = Config.load_env!
     Build.container_sbt("assembly")
+
+    if flink_cluster
+      Infra.compose("--profile", "flink", "up", "-d", "flink-jobmanager", "flink-taskmanager")
+      web_port = env.fetch("PCL_FLINK_WEB_PORT", "8081")
+      Infra.wait_until!("Flink JobManager REST API at localhost:#{web_port}") do
+        Infra.http_ok?("http://localhost:#{web_port}/overview")
+      end
+      puts "Flink cluster ready: http://localhost:#{web_port}"
+    end
 
     runtime_env = env.merge(
       "PCL_MAX_RECORDS" => ENV.fetch("PCL_MAX_RECORDS", env.fetch("PCL_MAX_RECORDS", "0"))
@@ -27,11 +36,16 @@ namespace :pipeline do
     run_pipeline([])
   end
 
-  desc "Build and run the Beam CDC graph with the classic FlinkRunner in embedded local mode"
+  desc "Build and run the Beam CDC graph on the local Flink JobManager/TaskManager cluster"
   task :flink do
     run_pipeline([
       "--runner=org.apache.beam.runners.flink.FlinkRunner",
-      "--flinkMaster=[local]"
-    ])
+      "--flinkMaster=flink-jobmanager:8081"
+    ], flink_cluster: true)
+  end
+
+  desc "Stop the local Flink JobManager and TaskManager"
+  task "flink:stop" do
+    Infra.compose("--profile", "flink", "stop", "flink-jobmanager", "flink-taskmanager")
   end
 end

@@ -56,13 +56,22 @@ For continuous consumption, leave `PCL_MAX_RECORDS=0` in `.env` and run
 `bundle exec rake pipeline:direct`. Stop it with Ctrl+C after the desired capture
 window.
 
-To run the same bounded graph through the classic FlinkRunner in embedded local
-mode, set the same record limit and use:
+To run the graph on a separate local Flink JobManager and TaskManager, set a
+record limit and use:
 
 ```powershell
 $env:PCL_MAX_RECORDS = '20'
 bundle exec rake pipeline:flink
 Remove-Item Env:PCL_MAX_RECORDS
+```
+
+This starts the two Flink containers and submits the Beam job to them. The
+JobManager dashboard is at `http://localhost:8081` by default. The Beam submitter
+is a short-lived container; the Flink containers stay running after a bounded
+job finishes so you can inspect them with `podman ps`. Stop them with:
+
+```powershell
+bundle exec rake pipeline:flink:stop
 ```
 
 The Beam runner prints per-run accepted, rejected and Kafka tombstone counters

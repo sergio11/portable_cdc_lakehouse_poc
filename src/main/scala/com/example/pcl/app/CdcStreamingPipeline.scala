@@ -124,11 +124,14 @@ object CdcStreamingPipeline {
       .withKeyDeserializer(classOf[StringDeserializer])
       .withValueDeserializer(classOf[StringDeserializer])
       .withConsumerConfigUpdates(
-        Map[String, Object](
-          "group.id"           -> s"pcl-${settings.sourceId}",
-          "auto.offset.reset"  -> "earliest",
-          "enable.auto.commit" -> "false"
-        ).asJava
+        java.util.Map.of[String, Object](
+          "group.id",
+          s"pcl-${settings.sourceId}",
+          "auto.offset.reset",
+          "earliest",
+          "enable.auto.commit",
+          "false"
+        )
       )
     val limitedRead =
       if (settings.maxRecords > 0)
@@ -177,23 +180,22 @@ object CdcStreamingPipeline {
   }
 
   private def icebergCatalog(settings: PclSettings): IcebergCatalogConfig = {
-    val catalogProperties = Map(
-      "type"                 -> "rest",
-      "uri"                  -> settings.icebergCatalogUri,
-      "warehouse"            -> settings.icebergWarehouse,
-      "io-impl"              -> "org.apache.iceberg.aws.s3.S3FileIO",
-      "s3.endpoint"          -> settings.s3Endpoint,
-      "s3.path-style-access" -> "true",
-      "client.region"        -> settings.s3Region,
-      "s3.access-key-id"     -> settings.s3AccessKey,
-      "s3.secret-access-key" -> settings.s3SecretKey
-    )
+    val catalogProperties = new java.util.HashMap[String, String]()
+    catalogProperties.put("type", "rest")
+    catalogProperties.put("uri", settings.icebergCatalogUri)
+    catalogProperties.put("warehouse", settings.icebergWarehouse)
+    catalogProperties.put("io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    catalogProperties.put("s3.endpoint", settings.s3Endpoint)
+    catalogProperties.put("s3.path-style-access", "true")
+    catalogProperties.put("client.region", settings.s3Region)
+    catalogProperties.put("s3.access-key-id", settings.s3AccessKey)
+    catalogProperties.put("s3.secret-access-key", settings.s3SecretKey)
 
     IcebergCatalogConfig
       .builder()
       .setCatalogName("pcl")
-      .setCatalogProperties(catalogProperties.asJava)
-      .setConfigProperties(Map.empty[String, String].asJava)
+      .setCatalogProperties(catalogProperties)
+      .setConfigProperties(new java.util.HashMap[String, String]())
       .build()
   }
 

@@ -163,6 +163,41 @@ services:
       retries: 12
       start_period: 120s
 
+  flink-jobmanager:
+    image: docker.io/library/flink:2.2.1-java21
+    container_name: pcl-flink-jobmanager
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 1024m
+        rest.address: flink-jobmanager
+        rest.bind-address: 0.0.0.0
+        parallelism.default: 1
+        classloader.parent-first-patterns.default: "java.";"org.apache.flink.";"com.esotericsoftware.kryo";"org.apache.hadoop.";"javax.annotation.";"org.xml";"javax.xml";"org.apache.xerces";"org.w3c";"org.rocksdb.";"org.slf4j";"org.apache.log4j";"org.apache.logging";"org.apache.commons.logging";"ch.qos.logback"
+    ports:
+      - "127.0.0.1:${PCL_FLINK_WEB_PORT:-8081}:8081"
+    profiles: ["flink"]
+
+  flink-taskmanager:
+    image: docker.io/library/flink:2.2.1-java21
+    container_name: pcl-flink-taskmanager
+    command: taskmanager
+    depends_on:
+      - flink-jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.memory.process.size: 1280m
+        taskmanager.memory.network.min: 128mb
+        taskmanager.memory.network.max: 128mb
+        taskmanager.memory.network.fraction: 0.2
+        taskmanager.memory.managed.fraction: 0.2
+        taskmanager.numberOfTaskSlots: 1
+        parallelism.default: 1
+        classloader.parent-first-patterns.default: "java.";"org.apache.flink.";"com.esotericsoftware.kryo";"org.apache.hadoop.";"javax.annotation.";"org.xml";"javax.xml";"org.apache.xerces";"org.w3c";"org.rocksdb.";"org.slf4j";"org.apache.log4j";"org.apache.logging";"org.apache.commons.logging";"ch.qos.logback"
+    profiles: ["flink"]
+
 volumes:
   postgres_data:
   kafka_data:
