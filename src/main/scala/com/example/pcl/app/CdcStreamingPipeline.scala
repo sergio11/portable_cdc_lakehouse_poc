@@ -24,12 +24,7 @@ import java.time.LocalDateTime
 import java.time.ZoneOffset
 import scala.jdk.CollectionConverters._
 
-/** Beam composition root for the streaming CDC application (SRS 2.1).
-  *
-  * Phase 2 reads Debezium JSON envelopes from Kafka, normalizes and validates them at the adapter
-  * boundary, routes malformed records to the dead-letter table, and appends accepted events to raw
-  * Iceberg history. The DirectRunner and FlinkRunner use this same graph.
-  */
+/** Shared Beam graph for reading Kafka CDC, validating events, and writing Iceberg history or DLQ. */
 object CdcStreamingPipeline {
 
   private val RawTag          = new TupleTag[Row]() {}

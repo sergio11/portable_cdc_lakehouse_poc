@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- Reconciliation queries (SRS FR-012, AC-12).
+-- Reconciliation queries.
 --
 -- Run with:  rake query:file[sql/reconciliation.sql]
 --
@@ -11,7 +11,7 @@
 
 -- ---------------------------------------------------------------------------
 -- 1. Live vs deleted split of the projection. Business queries always filter
---    is_deleted = false (SRS 6.2); this makes an accidental filter regression
+--    is_deleted = false; this makes an accidental filter regression
 --    immediately visible.
 -- ---------------------------------------------------------------------------
 SELECT is_deleted, count(*) AS rows_in_projection
@@ -32,7 +32,7 @@ SELECT DISTINCT primary_key AS order_key
 -- ---------------------------------------------------------------------------
 -- 3. Last event per key by source position, which is what the projection is
 --    expected to reflect. source_timestamp is deliberately NOT used for
---    ordering (SRS 5.2): arrival or wall-clock order is not a valid precedence.
+--    ordering: arrival or wall-clock order is not a valid precedence.
 -- ---------------------------------------------------------------------------
 SELECT primary_key,
        max(lsn)            AS last_lsn,
@@ -80,7 +80,7 @@ SELECT expected.primary_key                AS order_key,
  ORDER BY discrepancy, order_key;
 
 -- ---------------------------------------------------------------------------
--- 5. Event counts per operation, the headline observability counter (SRS FR-017).
+-- 5. Event counts per operation, the headline observability counter.
 -- ---------------------------------------------------------------------------
 SELECT operation,
        count(*)                            AS events,

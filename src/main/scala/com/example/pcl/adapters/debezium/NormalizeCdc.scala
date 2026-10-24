@@ -4,18 +4,7 @@ import com.example.pcl.adapters.debezium.DebeziumEnvelope.DecodeFailure
 import com.example.pcl.domain.model._
 import com.example.pcl.domain.rule.{EventIdentity, ValidateEvent}
 
-/** Translates Debezium envelopes into the canonical CDC contract (SRS FR-002).
-  *
-  * This is the boundary where wire format stops and the domain begins. Everything downstream of
-  * `normalize` deals exclusively with [[CdcEvent]], so a change in Debezium's payload shape is
-  * contained to this adapter and the domain rules stay untouched.
-  *
-  * Normalisation is where the canonical fields are *derived*, in particular:
-  *   - `operation` from Debezium's single-letter `op`;
-  *   - `event_id` from source identity plus ordering position, so the id is a pure function of the
-  *     change and redelivery becomes detectable (SRS FR-009);
-  *   - `is_snapshot` from the `r` operation code.
-  */
+/** Converts Debezium envelopes into canonical events and derives operation, identity, and snapshot fields. */
 object NormalizeCdc {
 
   /** Debezium operation codes mapped to the canonical operation vocabulary. */

@@ -2,17 +2,7 @@ package com.example.pcl.domain.rule
 
 import com.example.pcl.domain.model.CdcEvent
 
-/** Idempotent redelivery handling (SRS FR-009).
-  *
-  * Redelivery is expected, not exceptional: Kafka re-delivers on rebalance, and a replayed batch is
-  * applied twice by design. Because `event_id` is a pure function of the source identity and
-  * position, two records describing the same change always carry the same id, so collapsing on that
-  * id is safe and loses nothing.
-  *
-  * These functions are pure: they decide what a collection *should* contain, not what a consumer
-  * should do. Beam applies them per window; cross-batch idempotency is additionally guaranteed by
-  * [[ApplyChanges]], which refuses to overwrite state it has already seen.
-  */
+/** Pure helpers for collapsing repeated event ids within a collection. */
 object Deduplicate {
 
   /** Keep the first occurrence of each `event_id`, preserving input order, and report how many

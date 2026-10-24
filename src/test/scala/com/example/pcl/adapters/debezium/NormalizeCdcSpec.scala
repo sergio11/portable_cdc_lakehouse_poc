@@ -5,9 +5,7 @@ import com.example.pcl.domain.rule.ValidateEvent
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-/** Normalisation of Debezium envelopes into the canonical contract (SRS FR-002) and validation of
-  * the result (SRS FR-004, AC-02).
-  */
+/** Debezium envelope normalization and canonical event validation. */
 class NormalizeCdcSpec extends AnyFlatSpec with Matchers {
 
   private val Source = "pg-local-1"
@@ -78,14 +76,14 @@ class NormalizeCdcSpec extends AnyFlatSpec with Matchers {
     event.before should not be empty
   }
 
-  it should "flag snapshot rows as SNAPSHOT_READ with is_snapshot set (FR-010)" in {
+  it should "flag snapshot rows as SNAPSHOT_READ with is_snapshot set" in {
     val Right(event) = NormalizeCdc.normalize(snapshotRow(), Source)
 
     event.operation shouldBe Operation.SnapshotRead
     event.isSnapshot shouldBe true
   }
 
-  it should "derive the same event id for the same change (idempotency, FR-009)" in {
+  it should "derive the same event id for the same change" in {
     val Right(first)  = NormalizeCdc.normalize(insert(), Source)
     val Right(second) = NormalizeCdc.normalize(insert(), Source)
     first.eventId shouldBe second.eventId

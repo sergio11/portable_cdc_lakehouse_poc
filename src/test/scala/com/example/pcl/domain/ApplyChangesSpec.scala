@@ -6,10 +6,7 @@ import com.example.pcl.domain.rule.ApplyChanges
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-/** Unit tests for the pure state-transition rules (SRS 6.2, AC-04, AC-05, AC-06). These run with no
-  * I/O, no runner and no services — the fastest feedback loop and the proof that the core is
-  * portable.
-  */
+/** Pure state-transition tests; no runner or external services are required. */
 class ApplyChangesSpec extends AnyFlatSpec with Matchers {
 
   private def pos(lsn: Long): SourcePosition = SourcePosition(lsn, txId = None, sequenceNo = None)
@@ -47,7 +44,7 @@ class ApplyChangesSpec extends AnyFlatSpec with Matchers {
     applied.lastEventId shouldBe "e1"
   }
 
-  it should "apply a newer update over older state (AC-04)" in {
+  it should "apply a newer update over older state" in {
     val first = ApplyChanges(None, event(Operation.Create, 1L, "e1"))
       .asInstanceOf[ApplyOutcome.Applied]
       .next
@@ -60,21 +57,21 @@ class ApplyChangesSpec extends AnyFlatSpec with Matchers {
     applied.lastEventId shouldBe "e2"
   }
 
-  it should "treat exact redelivery as an idempotent duplicate (AC-06)" in {
+  it should "treat exact redelivery as an idempotent duplicate" in {
     val first = ApplyChanges(None, event(Operation.Create, 1L, "e1"))
       .asInstanceOf[ApplyOutcome.Applied]
       .next
     ApplyChanges(Some(first), event(Operation.Create, 1L, "e1")) shouldBe ApplyOutcome.Duplicate
   }
 
-  it should "ignore an older event without touching state (SRS 6.2)" in {
+  it should "ignore an older event without touching state" in {
     val newer = ApplyChanges(None, event(Operation.Create, 5L, "e5"))
       .asInstanceOf[ApplyOutcome.Applied]
       .next
     ApplyChanges(Some(newer), event(Operation.Update, 3L, "e3")) shouldBe ApplyOutcome.Stale
   }
 
-  it should "record a versioned tombstone on delete (AC-05)" in {
+  it should "record a versioned tombstone on delete" in {
     val live = ApplyChanges(None, event(Operation.Create, 1L, "e1"))
       .asInstanceOf[ApplyOutcome.Applied]
       .next
@@ -86,7 +83,7 @@ class ApplyChangesSpec extends AnyFlatSpec with Matchers {
     deleted.lastSourcePosition shouldBe pos(2L)
   }
 
-  it should "not resurrect a deleted entity from an older create (AC-05)" in {
+  it should "not resurrect a deleted entity from an older create" in {
     val live = ApplyChanges(None, event(Operation.Create, 1L, "e1"))
       .asInstanceOf[ApplyOutcome.Applied]
       .next

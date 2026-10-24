@@ -4,7 +4,7 @@ require "fileutils"
 require "securerandom"
 
 # Single source of truth for toolchain / container pins used by Rake tasks.
-# Mirror any change here into build.sbt and docs/compatibility-matrix.md.
+# Keep these versions aligned with build.sbt and compose.yaml.
 module Config
   ROOT = File.expand_path("..", __dir__)
 
@@ -24,7 +24,7 @@ module Config
   COURSIER_DIR     = "/root/.cache/coursier"
 
   # --- Service images, pinned to exact tags (never `latest`) -----------------
-  # Verified against their registries; see docs/compatibility-matrix.md.
+  # Pinned versions used by the local stack.
   POSTGRES_IMAGE = "docker.io/library/postgres:17.2-bookworm"
   KAFKA_IMAGE    = "docker.io/apache/kafka:3.9.1"
   DEBEZIUM_IMAGE = "quay.io/debezium/connect:3.2.4.Final"
@@ -49,7 +49,7 @@ module Config
         abort <<~MSG
           Missing .env file.
 
-          Local credentials are kept out of version control (SRS NFR-005).
+          Local credentials are kept out of version control.
           Create it once with:
 
             cp .env.example .env

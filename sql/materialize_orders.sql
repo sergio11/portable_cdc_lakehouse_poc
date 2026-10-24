@@ -1,5 +1,5 @@
 -- Materialize the latest source-positioned event per order into the current-state
--- projection (SRS FR-007, FR-008). The append-only raw table remains authoritative.
+-- projection. The append-only raw table remains authoritative.
 -- Safe to re-run: old/equal positions cannot overwrite a newer projection row.
 
 MERGE INTO __TARGET_TABLE__ AS target

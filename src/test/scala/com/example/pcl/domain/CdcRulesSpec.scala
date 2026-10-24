@@ -5,9 +5,7 @@ import com.example.pcl.domain.rule._
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-/** Rules that define event identity, validation, redelivery and ordering (SRS 5.1, 5.2, FR-004,
-  * FR-009, AC-02).
-  */
+/** Event identity, validation, redelivery, and ordering rules. */
 class CdcRulesSpec extends AnyFlatSpec with Matchers {
 
   private def pos(lsn: Long, tx: Option[String] = None, seq: Option[Long] = None) =
@@ -126,7 +124,7 @@ class CdcRulesSpec extends AnyFlatSpec with Matchers {
     duplicates shouldBe Map("e1" -> 3)
   }
 
-  it should "be idempotent when applied twice (AC-06)" in {
+  it should "be idempotent when applied twice" in {
     val input            = Seq(event("e1", lsn = 1L), event("e2", lsn = 2L))
     val (once, _)        = Deduplicate.collapse(input)
     val (twice, dropped) = Deduplicate.collapse(once ++ once)

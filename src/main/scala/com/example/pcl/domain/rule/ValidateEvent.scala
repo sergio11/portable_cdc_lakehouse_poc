@@ -2,18 +2,10 @@ package com.example.pcl.domain.rule
 
 import com.example.pcl.domain.model._
 
-/** Validation of a candidate canonical event (SRS FR-004).
-  *
-  * Pure and total: it inspects one event and returns either an enriched event or a rejection
-  * carrying a stable reason code. It never throws, never logs and never performs I/O, so it is
-  * trivially portable across runners and cheap to unit test exhaustively.
-  *
-  * Checks are ordered from cheapest to most specific so that the reported reason is the most
-  * fundamental problem with the event.
-  */
+/** Pure validation of canonical events. */
 object ValidateEvent {
 
-  /** Highest canonical contract version this build understands (SRS 5.1). */
+  /** Highest canonical contract version supported by this build. */
   val SupportedSchemaVersion = 1
 
   def validate(event: CdcEvent): Either[Rejection, CdcEvent] =
@@ -78,10 +70,7 @@ object ValidateEvent {
         Rejection(ReasonCode.MissingEnvelopeFields, "event_id is empty")
       )
 
-  /** Payload shape must agree with the operation (SRS FR-004). Debezium supplies `before` for
-    * deletes and updates, `after` for creates, updates and snapshot rows; anything else indicates a
-    * malformed or partially decoded message and must not reach the append-only history.
-    */
+  /** Require a before image for deletes and an after image for other operations. */
   private def checkPayload(event: CdcEvent): Either[Rejection, Unit] = {
     val hasBefore = event.before.exists(_.nonEmpty)
     val hasAfter  = event.after.exists(_.nonEmpty)

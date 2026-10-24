@@ -1,16 +1,6 @@
 package com.example.pcl.application.port
 
-/** Outbound port: where rejected events land with a machine-readable reason (SRS FR-005).
-  *
-  * @param eventId
-  *   originating event id when known
-  * @param reasonCode
-  *   stable, documented rejection reason
-  * @param rawReference
-  *   pointer/preview of the offending payload
-  * @param observedAt
-  *   wall-clock time the rejection was recorded
-  */
+/** Outbound port for rejected events and their machine-readable reasons. */
 final case class RejectedEvent(
     eventId: Option[String],
     reasonCode: String,

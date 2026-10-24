@@ -2,9 +2,7 @@
 # Portable CDC Lakehouse — local lakehouse stack.
 #
 # Design notes
-#   * Every image is pinned to an exact tag. `latest` is never used, so a clean
-#     environment always resolves to the versions validated in
-#     docs/compatibility-matrix.md.
+#   * Every image uses a pinned tag for reproducible local runs.
 #   * Networking is deliberately conservative. Kafka advertises only its
 #     in-network address (`kafka:9092`) and is NOT published to the host, so
 #     there is a single unambiguous address for clients. The Beam application
@@ -24,7 +22,7 @@ services:
   postgres:
     image: docker.io/library/postgres:17.2-bookworm
     container_name: pcl-postgres
-    # Logical decoding is the mechanism Debezium reads from (SRS FR-001).
+    # Debezium reads PostgreSQL changes from the logical WAL.
     command:
       - postgres
       - -c

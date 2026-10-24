@@ -118,7 +118,7 @@ DirectRunner executes the graph locally and is useful during development. The cl
 
 Iceberg stores both the append-only event history and the current-state projection. The raw table preserves the sequence of accepted changes for inspection and replay. The silver table holds one row per order and records deletes as versioned tombstones so older changes cannot silently restore a deleted order. Iceberg snapshots make committed table changes inspectable.
 
-### 🪣 MinIO — local S3-compatible object storage
+### 🗄️ MinIO — local S3-compatible object storage
 
 MinIO gives Beam and Trino a shared S3 API endpoint without requiring a cloud account. Iceberg data files live in its persistent Podman volume. The POC builds a pinned upstream MinIO release locally because the upstream community container image is no longer published; this is documented as an implementation constraint.
 
@@ -169,7 +169,6 @@ From Windows PowerShell, copy `.env.example` to `.env` and set the local Postgre
 
 ```powershell
 Copy-Item .env.example .env
-# Set the local PostgreSQL and MinIO passwords in .env.
 bundle exec rake infra:up
 bundle exec rake lakehouse:init
 bundle exec rake debezium:register

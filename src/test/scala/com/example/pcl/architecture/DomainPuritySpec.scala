@@ -4,12 +4,7 @@ import com.example.pcl.config.PclSettings
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-/** Guards the hexagonal boundary: the `domain` package must stay pure Scala so the same logic runs
-  * unchanged under DirectRunner and FlinkRunner (ADR-001, ADR-002).
-  *
-  * We assert this by scanning the compiled bytecode of `domain` for forbidden references (Beam,
-  * Kafka, Iceberg, logging, clock). This is a real structural test, not a comment: it fails the
-  * build if someone leaks a framework type into the core.
+/** Ensures the domain bytecode stays free of Beam, Kafka, Iceberg, logging, and clock APIs.
   */
 class DomainPuritySpec extends AnyFlatSpec with Matchers {
 

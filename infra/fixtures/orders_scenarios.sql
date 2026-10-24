@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- Deterministic CDC scenarios (SRS FR-018).
+-- Deterministic CDC scenarios.
 --
 -- Applied on demand with `rake fixtures:scenarios`, AFTER the Debezium connector
 -- is registered, so every statement below is captured as an ordinary WAL change
@@ -36,12 +36,12 @@ UPDATE public.orders
    SET total_amount = 349.00, updated_at = TIMESTAMPTZ '2026-01-02 09:00:10+00'
  WHERE order_id = 1002;
 
--- 1004: delete -> must become a versioned tombstone (SRS FR-008).
+-- 1004: delete -> must become a versioned tombstone.
 DELETE FROM public.orders WHERE order_id = 1004;
 
 -- 1005: delete followed by a newer re-insert of the same key. The final state
 -- must be live, because the create carries a strictly newer source position than
--- the delete (SRS FR-005 / AC-05).
+-- the delete.
 DELETE FROM public.orders WHERE order_id = 1005;
 INSERT INTO public.orders (order_id, customer_id, status, total_amount, currency, updated_at)
 VALUES (1005, 504, 'NEW', 99.99, 'EUR', TIMESTAMPTZ '2026-01-02 09:00:30+00');

@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // Portable CDC Lakehouse — build definition
-// Single source of truth for every pinned version. See docs/compatibility-matrix.md
+// Pinned build versions.
 // ---------------------------------------------------------------------------
 
 import sbtassembly.AssemblyPlugin.autoImport._
@@ -26,7 +26,7 @@ ThisBuild / organization := "com.example"
 ThisBuild / version      := "0.1.0-SNAPSHOT"
 ThisBuild / scalaVersion := Versions.scala213
 
-// Beam + supporting JVM toolchain. Scala sits on top of the Beam Java SDK (ADR-001).
+// Scala uses Beam's Java SDK for the pipeline runtime.
 // beam-sdks-java-io-kafka transitively references Confluent's schema-registry
 // client + avro serializer, which are published to Confluent's repo, not Central.
 // Beam declares this resolver itself; consumers must restate it.

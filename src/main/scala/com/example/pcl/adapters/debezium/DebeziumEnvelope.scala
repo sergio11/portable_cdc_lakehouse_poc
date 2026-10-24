@@ -41,7 +41,7 @@ object DebeziumEnvelope {
   /** Decode a Debezium message body.
     *
     * Returns a [[DecodeFailure]] rather than throwing, so a malformed message becomes a rejected
-    * event with a reason code instead of killing the pipeline (SRS FR-005).
+    * event with a reason code instead of killing the pipeline.
     */
   def decode(json: String): Either[DecodeFailure, DebeziumEnvelope] =
     io.circe.parser

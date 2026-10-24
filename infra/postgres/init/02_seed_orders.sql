@@ -3,12 +3,10 @@
 --
 -- This runs BEFORE the Debezium connector is registered, so these rows are
 -- emitted by Debezium's initial snapshot as SNAPSHOT_READ events. That is the
--- input for the snapshot-vs-CDC precedence rule (SRS FR-010) and it is why this
+-- input for snapshot-versus-WAL precedence, which is why this
 -- file is kept separate from infra/fixtures/orders_scenarios.sql.
 --
--- Values are fixed and explicit (ids, timestamps and amounts) so the same run
--- always produces the same set of events and therefore the same expected state
--- (SRS FR-018, AC-01).
+-- Fixed values make the initial snapshot reproducible.
 -- ---------------------------------------------------------------------------
 
 TRUNCATE TABLE public.orders;

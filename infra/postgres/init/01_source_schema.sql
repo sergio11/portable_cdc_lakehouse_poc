@@ -1,9 +1,8 @@
 -- ---------------------------------------------------------------------------
--- Operational source schema for the POC (SRS 2.1).
+-- Operational source schema for the POC.
 --
 -- Scope: the MVP targets a single table, `public.orders`, with a single source
--- and a stable primary key (SRS 5.2). `customers` and `payments` are explicitly
--- out of scope for the MVP; see the scope decision in docs/architecture.md.
+-- and a stable primary key. `customers` and `payments` are outside this POC's scope.
 --
 -- Loaded only on first initialisation of an empty Postgres volume.
 -- ---------------------------------------------------------------------------

@@ -1,17 +1,6 @@
 package com.example.pcl.config
 
-/** Typed application settings, loaded once at startup from environment variables. The domain and
-  * application layers never read the environment directly (SRS FR-015); every value is threaded in
-  * explicitly, which keeps the core testable and portable.
-  *
-  * Runtime settings are explicit inputs to the adapters; only the stable source and run identity
-  * are required by the domain-facing configuration parser.
-  *
-  * @param runId
-  *   correlates every log line and metric for a single execution
-  * @param sourceId
-  *   stable identifier stamped onto events for this source database
-  */
+/** Typed runtime settings, loaded from the environment and passed explicitly to adapters. */
 final case class PclSettings(
     runId: String,
     sourceId: String,

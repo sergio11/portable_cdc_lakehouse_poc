@@ -2,64 +2,46 @@ package com.example.pcl.domain.rule
 
 import com.example.pcl.domain.model._
 
-/** Outcome of applying a single CDC event to an entity's projected state (SRS 6.2). The caller
-  * (materializer) maps each outcome to a sink action; the domain never touches I/O.
-  */
+/** Result of applying one event to projected state. */
 sealed trait ApplyOutcome
 object ApplyOutcome {
 
   /** Event produced a new/updated live state. */
   final case class Applied(next: StateEntity) extends ApplyOutcome
 
-  /** Redelivery of an event already reflected in state; ignore it (SRS FR-009). */
+  /** Exact redelivery; ignore it. */
   case object Duplicate extends ApplyOutcome
 
-  /** Event is older than applied state; state is left untouched (SRS 6.2). */
+  /** Older event; leave state unchanged. */
   case object Stale extends ApplyOutcome
 
-  /** No reliable order between positions; caller must quarantine (SRS 5.2). */
+  /** Position cannot be ordered; caller must quarantine. */
   case object Ambiguous extends ApplyOutcome
 
   /** Same position but conflicting payload; surface a discrepancy, never pick arbitrarily. */
   final case class Conflict(existingEventId: String) extends ApplyOutcome
 }
 
-/** Pure state-transition rules for a single entity. No I/O, no clock, no randomness — every
-  * decision is a function of (current state, incoming event). This is the core the portability
-  * claim rests on: identical logic runs under any Beam runner (ADR-002).
-  */
+/** Pure state transitions shared by all Beam runners. */
 object ApplyChanges {
 
   import ApplyOutcome._
 
-  /** Apply `event` on top of `current` (None when the entity has no prior state).
-    *
-    * Rules implemented (SRS 6.2):
-    *   - newer position -> apply (create/update/delete)
-    *   - same position + same eventId -> Duplicate
-    *   - older position -> Stale
-    *   - same position + different eventId -> Conflict (only if payload differs)
-    *   - unordered positions -> Ambiguous
-    *   - delete marks isDeleted and keeps a versioned tombstone (SRS FR-008)
-    */
+  /** Apply an event to the current state, if present. */
   def apply(current: Option[StateEntity], event: CdcEvent): ApplyOutcome =
     current match {
       case None =>
         // First time we see this entity. Snapshots and creates both seed live state.
         event.operation match {
           case Operation.Delete =>
-            // A delete with no prior state still records a tombstone so that an older
-            // create replayed later cannot resurrect the entity (SRS FR-008).
+            // Keep a tombstone so an older replay cannot resurrect the entity.
             Applied(tombstone(event))
           case _ =>
             Applied(liveState(event))
         }
 
       case Some(existing) =>
-        // `eventId` is the deterministic identity of an event, so it is the primary
-        // idempotency key (SRS FR-009): an exact redelivery is a Duplicate regardless
-        // of how positions compare. We only consult position ordering to decide
-        // whether a *different* event supersedes the applied state.
+        // Event identity detects redelivery before comparing source positions.
         if (event.eventId == existing.lastEventId) Duplicate
         else
           VersionComparison.compare(event.sourcePosition, existing.lastSourcePosition) match {
@@ -76,8 +58,7 @@ object ApplyChanges {
               event.operation match {
                 case Operation.Delete       => Applied(tombstone(event))
                 case Operation.SnapshotRead =>
-                  // Snapshot must not clobber a newer WAL change (SRS FR-010). Because we
-                  // only reach here when the snapshot position is strictly newer, apply it.
+                  // Apply only when its source position is newer.
                   Applied(liveState(event))
                 case _ => Applied(liveState(event))
               }

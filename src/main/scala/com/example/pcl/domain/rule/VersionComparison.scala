@@ -2,10 +2,7 @@ package com.example.pcl.domain.rule
 
 import com.example.pcl.domain.model.SourcePosition
 
-/** Result of comparing an incoming position against the position already applied to an entity (SRS
-  * FR-007, 6.2). A sealed ADT (rather than an `Enumeration`) so callers get real exhaustiveness
-  * checking at compile time.
-  */
+/** Result of comparing incoming and applied source positions. */
 sealed trait Verdict
 
 object Verdict {
@@ -13,7 +10,7 @@ object Verdict {
   /** Incoming position is strictly newer than applied state. */
   case object Newer extends Verdict
 
-  /** Incoming position is strictly older; it must not overwrite state (SRS 6.2). */
+  /** Incoming position is older; it must not overwrite state. */
   case object Older extends Verdict
 
   /** Same position. Callers then compare `eventId` to detect idempotent redelivery. */
@@ -23,9 +20,7 @@ object Verdict {
   case object Ambiguous extends Verdict
 }
 
-/** Compares two source positions to decide whether an incoming event supersedes the state already
-  * recorded for an entity (SRS FR-007, 6.2).
-  */
+/** Compares source positions to determine whether an event supersedes current state. */
 object VersionComparison {
 
   /** Decide how `incoming` relates to `applied` for the same entity. */

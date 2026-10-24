@@ -4,10 +4,7 @@ import com.example.pcl.domain.model.SourcePosition
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-/** Ordering semantics for source positions (SRS 5.2). LSN decides first; transaction id and
-  * intra-transaction ordinal refine ties; equal positions compare as 0 so callers fall back to
-  * `eventId` for idempotency.
-  */
+/** Position ordering uses LSN, then transaction id and sequence to refine ties. */
 class SourcePositionSpec extends AnyFlatSpec with Matchers {
 
   "comparePosition" should "order by LSN when LSNs differ" in {

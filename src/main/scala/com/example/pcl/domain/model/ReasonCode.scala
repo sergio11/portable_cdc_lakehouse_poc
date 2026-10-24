@@ -1,11 +1,6 @@
 package com.example.pcl.domain.model
 
-/** Closed vocabulary for rejection reasons (SRS FR-005, 6.1 `ops.cdc_dead_letter`).
-  *
-  * These values are part of the observable contract: operators, dashboards and tests assert on them
-  * directly, so they must stay stable and must not encode free-form text. A human-readable detail
-  * travels alongside the code, never inside it.
-  */
+/** Stable rejection codes for `ops.cdc_dead_letter`; details stay in a separate field. */
 sealed abstract class ReasonCode(val code: String)
 
 object ReasonCode {

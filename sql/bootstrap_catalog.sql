@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- Iceberg lakehouse bootstrap (SRS 6.1).
+-- Create the Iceberg schemas and tables used by the POC.
 --
 -- Executed against Trino, which creates Iceberg tables through the REST catalog
 -- configured in infra/trino/etc/catalog/iceberg.properties.template. The REST
@@ -24,10 +24,10 @@ CREATE SCHEMA IF NOT EXISTS silver;
 CREATE SCHEMA IF NOT EXISTS ops;
 
 -- ---------------------------------------------------------------------------
--- raw.order_cdc_events : append-only history (SRS FR-006)
+-- raw.order_cdc_events: append-only history
 --
 -- Every accepted event lands here and is never overwritten. This table is the
--- source of truth for replay (SRS FR-011) and reconciliation (SRS FR-012).
+-- source of truth for replay and reconciliation.
 -- `batch_id` ties a row to the run/microbatch that produced it.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS raw.order_cdc_events (
@@ -53,11 +53,11 @@ CREATE TABLE IF NOT EXISTS raw.order_cdc_events (
 );
 
 -- ---------------------------------------------------------------------------
--- silver.orders_current : current state projection (SRS 6.1)
+-- silver.orders_current: current-state projection
 --
 -- One row per business key. Deletes are represented as a versioned tombstone
 -- (is_deleted = true) rather than a physical removal, so an older event replayed
--- later can never resurrect the row (SRS FR-008). Business queries filter on
+-- later can never resurrect the row. Business queries filter on
 -- is_deleted = false.
 --
 -- last_lsn / last_tx_id / last_seq_no record the source position of the event
@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS silver.orders_current (
 );
 
 -- ---------------------------------------------------------------------------
--- ops.cdc_dead_letter : rejected events (SRS FR-005, 6.1)
+-- ops.cdc_dead_letter: rejected events
 --
 -- reason_code is a stable, documented identifier so operators and tests can
 -- assert on rejection causes without string-matching log output.
