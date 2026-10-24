@@ -165,123 +165,57 @@ Ordering uses LSN and transaction/sequence tie-breakers where available. Event t
 
 ## 🚀 Quick start
 
-The commands below are for Windows PowerShell from the repository root. This README contains setup, replay, and operational instructions.
+From Windows PowerShell, copy `.env.example` to `.env`, set the local passwords, then run:
 
 ```powershell
 Copy-Item .env.example .env
-# Edit .env and set local Postgres and MinIO passwords.
-
+# Set the local PostgreSQL and MinIO passwords in .env.
 bundle exec rake infra:up
 bundle exec rake lakehouse:init
 bundle exec rake debezium:register
-bundle exec rake debezium:status
 bundle exec rake fixtures:scenarios
-```
-
-Run the same bounded Kafka fixture with either runner. Use a clean stack or record the history baseline if comparing outputs, because each capture appends to raw history.
-
-```powershell
-$env:PCL_MAX_RECORDS = '20'
-bundle exec rake pipeline:direct
-Remove-Item Env:PCL_MAX_RECORDS
-
-$env:PCL_MAX_RECORDS = '20'
-bundle exec rake pipeline:flink
-Remove-Item Env:PCL_MAX_RECORDS
-```
-
-`pipeline:flink` starts `pcl-flink-jobmanager` and `pcl-flink-taskmanager` and keeps them running after the bounded submission. The Flink dashboard defaults to [http://localhost:8081](http://localhost:8081). The submitter container is temporary; Beam operators execute in the TaskManager.
-
-```powershell
+$env:PCL_MAX_RECORDS = '20'; bundle exec rake pipeline:flink; Remove-Item Env:PCL_MAX_RECORDS
 bundle exec rake lakehouse:materialize
-bundle exec rake lakehouse:describe
 bundle exec rake query:file[sql/reconciliation.sql]
 ```
 
-Replay into an isolated table (LSN bounds are optional and inclusive):
+Open the Flink dashboard at [localhost:8081](http://localhost:8081). Stop the stack with `bundle exec rake infra:down`.
 
-```powershell
-$env:PCL_REPLAY_ID = 'audit1'
-$env:PCL_REPLAY_FROM_LSN = '0'
-$env:PCL_REPLAY_TO_LSN = '999999999'
-bundle exec rake lakehouse:replay
-Remove-Item Env:PCL_REPLAY_ID
-Remove-Item Env:PCL_REPLAY_FROM_LSN
-Remove-Item Env:PCL_REPLAY_TO_LSN
-```
+## 📸 Results from the running POC
 
-Omit both bounds for a full-history reconstruction. A bounded replay writes only events in that LSN interval into a fresh table; it does not represent the complete state at the end of the interval unless that interval includes the required baseline/snapshot events for every key.
-
-Stop services while preserving their volumes; the Flink services are stopped with the stack. `infra:reset` deletes all stack volumes and is destructive.
-
-```powershell
-bundle exec rake infra:status
-bundle exec rake infra:logs[flink-taskmanager]
-bundle exec rake infra:down
-```
-
-Use `bundle exec rake -T` to list the operational tasks. Build and local checks are available through `bundle exec rake verify`; CI/CD is intentionally out of scope.
-
-## 📊 Observability and evidence
-
-- Beam emits a JSON startup record with `run_id`, source, topic, and status, then reports available Beam counters such as accepted events, rejected events, Kafka tombstones, and Iceberg writer/snapshot counts.
-- `rake lakehouse:describe` lists tables and current-state Iceberg snapshots.
-- `rake query:file[sql/reconciliation.sql]` reports operation counts, duplicate event IDs, dead-letter reasons, and per-key discrepancies.
-- A bounded DirectRunner Kafka-to-Iceberg capture completed and was read back through Trino.
-- A bounded classic FlinkRunner job completed in the separate Podman cluster. The recorded run read 15 Kafka records, accepted 13 CDC events, observed 2 tombstones, and wrote one Iceberg snapshot.
-- `rake verify` passed with 54 unit and architecture tests. It does not replace the outstanding integration and recovery scenarios listed below.
-
-## 🧪 POC validation status
-
-The POC demonstrates the main CDC-to-lakehouse path, but it is **not a complete production validation**. The current evidence and remaining experimental work are summarized here.
-
-| Area | Status | Evidence / remaining work |
-|---|---|---|
-| CDC capture | Demonstrated | PostgreSQL → Debezium → Kafka fixture exercised. |
-| Canonical contract and validation | Unit-tested; integration pending | Normalization/validation is unit-tested and the Beam graph routes invalid envelopes to DLQ; an invalid input still needs an end-to-end assertion. |
-| DirectRunner and FlinkRunner | Both execute; comparison pending | Bounded jobs completed on both. Compare their logical outputs using isolated, identical fixture baselines. |
-| Current-state upsert and delete | Demonstrated for `orders` | Newer source positions win; deletes persist as tombstones; reconciliation inspects the projection. |
-| Idempotency and duplicates | Partial | Domain and materializer idempotency are implemented; duplicate delivery is not yet an automated end-to-end scenario, and raw remains append-only. |
-| Replay reconstruction | Implemented; result check pending | Isolated full/LSN-range replay exists. Compare replay keys, business values, and tombstones with an expected reference. |
-| Recovery after restart | Not validated | Checkpoint/offset and failure-window restart behavior have not been tested. |
-| Iceberg and Podman operations | Demonstrated | Trino inspects tables and snapshots; Rake commands cover start/status/logs/stop/reset. |
-| Observability and performance | Partial | Available counters and SQL reports cover part of the pipeline. Complete duplicate/obsolete/commit counters and record a synthetic throughput/duration measurement. |
-
-### 🔭 Remaining experimental work
-
-1. Add deterministic duplicate and out-of-order fixture scenarios; prove snapshot-versus-WAL precedence on an isolated dataset.
-2. Add an integration check that injects an invalid Debezium envelope and asserts its reason and payload in `ops.cdc_dead_letter`.
-3. Compare DirectRunner and FlinkRunner outputs against the same fixture baseline, then reconcile both.
-4. Reconcile a replay target by keys, business values, and tombstones; associate the replay ID with the result evidence.
-5. Exercise restart/failure windows and define checkpoint/offset behavior. The POC does not claim end-to-end exactly-once.
-6. Complete observability for duplicate, obsolete, commit, and discrepancy counters; current logs/counters and SQL reports cover only part of the pipeline.
-7. Record a documented synthetic-load duration/throughput measurement. No production SLA is implied.
-
-CI/CD, production cloud deployment, HA, Kubernetes, and a production SLA are outside this experiment's scope.
-
-## ⚖️ Strengths and trade-offs
-
-| Strength | Trade-off / boundary |
-|---|---|
-| Raw history, current state, and replay have separate responsibilities. | Raw is append-only and can contain repeated deliveries; logical projection correctness does not deduplicate the history table. |
-| Both local and distributed Beam runners use the same application graph. | Compatibility is proven only for this pinned local Podman stack and bounded capture. |
-| MinIO, Iceberg REST, Iceberg tables, and Trino run locally. | MinIO is built from a pinned upstream source release; the REST catalog is a POC fixture backed by SQLite. |
-| Source positions and delete tombstones protect state ordering. | Recovery/checkpoint semantics and exactly-once behavior across Kafka, Beam, and Iceberg are not claimed. |
-| Rake offers repeatable manual operations without CI/CD. | Local resource usage and throughput have not been benchmarked as production characteristics. |
-
-## 🗺️ Repository map
+Evidence captured from the active Podman cluster on **24 October 2026**:
 
 ```text
-compose.yaml                         Podman services and the optional Flink profile
-src/main/scala/.../domain            Pure CDC contract and state rules
-src/main/scala/.../adapters          Debezium decoding and normalization
-src/main/scala/.../app               Beam pipeline composition and IcebergIO
-sql/bootstrap_catalog.sql            Iceberg raw, silver, and ops schemas
-sql/materialize_orders.sql           Idempotent current-state MERGE
-sql/reconciliation.sql               Counts, tombstones, and discrepancy report
-infra/fixtures/                      Deterministic PostgreSQL CDC mutations
-rakelib/                             Build, infrastructure, pipeline, replay, and query tasks
+$ bundle exec rake infra:status
+8 containers running: PostgreSQL, Kafka, MinIO, Iceberg REST, Trino,
+Kafka Connect, Flink JobManager, and Flink TaskManager
+
+$ Flink REST: GET /jobs/d0aaab107904874e180ef56c5c452cb7
+state=FINISHED  duration=91.9s  tasks=8/8 finished  failed=0
+
+$ bundle exec rake lakehouse:materialize
+Current-state projection refreshed (query 20261024_130008_00003_22msk).
+
+$ bundle exec rake query:file[sql/reconciliation.sql]
+current state: 6 active orders, 1 delete tombstone
+per-key reconciliation: 7 keys, all position/key checks = ok
+raw history: 52 rows, 13 distinct event IDs (append-only; repeated fixture runs)
+dead-letter rows: 0
+
+$ PCL_REPLAY_ID=readme_proof bundle exec rake lakehouse:replay
+7 keys, 1 tombstone (query 20261024_130215_00011_22msk)
 ```
+
+The distributed Beam run consumed 15 Kafka records, accepted 13 CDC events, observed 2 Kafka tombstones, and wrote one Iceberg snapshot. Replay materialized into its own table, leaving the canonical projection untouched.
+
+## 🔎 What this evidence proves
+
+- PostgreSQL CDC events travel through Debezium and Kafka into Beam, and the FlinkRunner job completes on the local Flink cluster.
+- Trino can materialize and inspect Iceberg current state; deletes are represented as tombstones.
+- The reconciliation report checks expected key presence and source-position agreement. The replay output above checks key and tombstone counts; neither result compares every business column.
+- Raw history is append-only, so repeated fixture runs explain the 52 rows for 13 distinct event IDs.
+
+This is a **proof of concept**, not a production-ready platform. Restart/recovery behavior, full business-value replay comparison, invalid-message integration checks, and performance benchmarking remain unvalidated. Exactly-once processing and production throughput are not claimed.
 
 ## 📜 License
 

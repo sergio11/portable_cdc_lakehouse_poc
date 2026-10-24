@@ -108,7 +108,10 @@ namespace :lakehouse do
     env = Config.load_env!
     Infra.ensure_iceberg_bucket!(env)
     path = File.join(Config::ROOT, "sql", "materialize_orders.sql")
-    result = Trino.execute_file(path, env)
+    sql = File.read(path)
+      .gsub("__TARGET_TABLE__", "iceberg.silver.orders_current")
+      .gsub("__RAW_FILTER__", "TRUE")
+    result = Trino.execute(sql.sub(/;\s*\z/, ""), env)
     puts "Current-state projection refreshed (query #{result['query_id']})."
   end
 
