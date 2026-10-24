@@ -102,7 +102,10 @@ bundle exec rake lakehouse:replay
 
 This creates `silver.orders_current_replay_audit1` and leaves the canonical
 `silver.orders_current` untouched. Use a new replay identifier for an
-independent result.
+independent result. Omit both bounds for a full-history reconstruction. A
+bounded replay starts with an empty target and only includes events in that
+LSN interval; it represents the full state only when the interval contains a
+baseline/snapshot for every key.
 
 ## 6. Stop or reset the stack
 
