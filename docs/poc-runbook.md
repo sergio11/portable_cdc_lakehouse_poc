@@ -69,6 +69,20 @@ order and merges it into `silver.orders_current`; older events cannot overwrite
 newer state. A delete updates a versioned tombstone. Reconciliation compares
 the projection to the append-only raw event history.
 
+To replay raw history into an isolated silver table, set a unique identifier
+and optional inclusive source LSN bounds:
+
+```powershell
+$env:PCL_REPLAY_ID = 'audit1'
+$env:PCL_REPLAY_FROM_LSN = '0' # optional
+$env:PCL_REPLAY_TO_LSN = '999999999' # optional
+bundle exec rake lakehouse:replay
+```
+
+This creates `silver.orders_current_replay_audit1` and leaves the canonical
+`silver.orders_current` untouched. Use a new replay identifier for an
+independent result.
+
 ## 6. Stop or reset the stack
 
 ```powershell

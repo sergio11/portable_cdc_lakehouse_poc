@@ -8,6 +8,7 @@ import org.apache.beam.runners.direct.DirectRunner
 import org.apache.beam.sdk.Pipeline
 import org.apache.beam.sdk.io.iceberg.{IcebergCatalogConfig, IcebergIO}
 import org.apache.beam.sdk.io.kafka.KafkaIO
+import org.apache.beam.sdk.metrics.{Metrics, MetricsFilter}
 import org.apache.beam.sdk.options.{PipelineOptions, PipelineOptionsFactory}
 import org.apache.beam.sdk.schemas.Schema
 import org.apache.beam.sdk.schemas.logicaltypes.SqlTypes
@@ -33,6 +34,9 @@ object CdcStreamingPipeline {
 
   private val RawTag        = new TupleTag[Row]() {}
   private val DeadLetterTag = new TupleTag[Row]() {}
+  private val AcceptedEvents = Metrics.counter("pcl.cdc", "accepted_events")
+  private val RejectedEvents = Metrics.counter("pcl.cdc", "rejected_events")
+  private val KafkaTombstones = Metrics.counter("pcl.cdc", "kafka_tombstones")
 
   private val ImageType = Schema.FieldType
     .map(Schema.FieldType.STRING, Schema.FieldType.STRING)
@@ -92,7 +96,20 @@ object CdcStreamingPipeline {
         println(
           s"""{"component":"CdcStreamingPipeline","run_id":"${settings.runId}","source_id":"${settings.sourceId}","topic":"${settings.cdcTopic}","status":"running"}"""
         )
-        pipeline.run().waitUntilFinish()
+        val result = pipeline.run()
+        result.waitUntilFinish()
+        try {
+          val counters = result.metrics().queryMetrics(MetricsFilter.builder().build()).getCounters.asScala
+          counters.foreach { counter =>
+            val name = counter.getKey.metricName()
+            println(
+              s"""{"component":"CdcStreamingPipeline","run_id":"${settings.runId}","metric":"${name.getName}","namespace":"${name.getNamespace}","value":${counter.getCommitted.getValue}}"""
+            )
+          }
+        } catch {
+          case error: UnsupportedOperationException =>
+            System.err.println(s"[METRICS_UNAVAILABLE] ${error.getMessage}")
+        }
     }
 
   private[app] def build(options: PipelineOptions, settings: PclSettings): Pipeline = {
@@ -189,10 +206,14 @@ object CdcStreamingPipeline {
       // skipped; the delete envelope itself was already routed through NormalizeCdc.
       if (payload != null)
         NormalizeCdc.normalize(payload, sourceId) match {
-          case Right(event) => context.output(RawTag, toRawRow(event, payload, runId))
+          case Right(event) =>
+            AcceptedEvents.inc()
+            context.output(RawTag, toRawRow(event, payload, runId))
           case Left(reason) =>
+            RejectedEvents.inc()
             context.output(DeadLetterTag, toDeadLetterRow(reason, payload, runId))
         }
+      else KafkaTombstones.inc()
     }
   }
 

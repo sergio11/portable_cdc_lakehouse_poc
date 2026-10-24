@@ -111,6 +111,35 @@ namespace :lakehouse do
     result = Trino.execute_file(path, env)
     puts "Current-state projection refreshed (query #{result['query_id']})."
   end
+
+  desc "Replay raw CDC history into an isolated table: PCL_REPLAY_ID=run1 [PCL_REPLAY_FROM_LSN=..] [PCL_REPLAY_TO_LSN=..]"
+  task :replay do
+    env = Config.load_env!
+    replay_id = ENV.fetch("PCL_REPLAY_ID") { abort("Set PCL_REPLAY_ID to a short identifier using lowercase letters, digits, or underscores.") }
+    abort("PCL_REPLAY_ID must match [a-z][a-z0-9_]{0,39}.") unless replay_id.match?(/\A[a-z][a-z0-9_]{0,39}\z/)
+
+    from_lsn = ENV["PCL_REPLAY_FROM_LSN"]
+    to_lsn = ENV["PCL_REPLAY_TO_LSN"]
+    [from_lsn, to_lsn].compact.each do |value|
+      abort("Replay LSN bounds must be non-negative integers.") unless value.match?(/\A\d+\z/)
+    end
+    abort("PCL_REPLAY_FROM_LSN must not exceed PCL_REPLAY_TO_LSN.") if from_lsn && to_lsn && from_lsn.to_i > to_lsn.to_i
+
+    target = "iceberg.silver.orders_current_replay_#{replay_id}"
+    Infra.ensure_iceberg_bucket!(env)
+    Trino.execute("CREATE TABLE IF NOT EXISTS #{target} WITH (format_version = 2) AS SELECT * FROM iceberg.silver.orders_current WHERE false", env)
+
+    filter = [
+      from_lsn && "lsn >= #{from_lsn}",
+      to_lsn && "lsn <= #{to_lsn}"
+    ].compact.join(" AND ")
+    filter = "TRUE" if filter.empty?
+    template = File.read(File.join(Config::ROOT, "sql", "materialize_orders.sql"))
+    sql = template.gsub("__TARGET_TABLE__", target).gsub("__RAW_FILTER__", filter)
+    result = Trino.execute(sql.sub(/;\s*\z/, ""), env)
+    summary = Trino.execute("SELECT count(*), count_if(is_deleted) FROM #{target}", env)["data"].flatten
+    puts "Replay #{replay_id} materialized to #{target}: #{summary[0]} keys, #{summary[1]} tombstones (query #{result['query_id']})."
+  end
 end
 
 namespace :debezium do

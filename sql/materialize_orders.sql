@@ -2,7 +2,7 @@
 -- projection (SRS FR-007, FR-008). The append-only raw table remains authoritative.
 -- Safe to re-run: old/equal positions cannot overwrite a newer projection row.
 
-MERGE INTO iceberg.silver.orders_current AS target
+MERGE INTO __TARGET_TABLE__ AS target
 USING (
     SELECT order_id,
            operation,
@@ -33,6 +33,7 @@ USING (
                           event_id DESC
                ) AS event_rank
           FROM iceberg.raw.order_cdc_events
+         WHERE __RAW_FILTER__
       ) ranked
      WHERE event_rank = 1
 ) AS source
