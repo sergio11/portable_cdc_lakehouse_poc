@@ -100,8 +100,8 @@ long-running job operations remain outside this local validation.
 ## 5. Known Flink dependency risk
 
 The bounded distributed run did not encounter the `lz4-java` capability conflict
-between Flink's `at.yawk.lz4:lz4-java` and Kafka's `org.lz4:lz4-java`. A remote
-production cluster has not been exercised.
+between Flink's `at.yawk.lz4:lz4-java` and Kafka's `org.lz4:lz4-java`. A separately
+managed production cluster has not been exercised.
 
 ## 6. Environment notes
 
