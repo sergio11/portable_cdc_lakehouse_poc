@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "fileutils"
+require "securerandom"
 
 # Single source of truth for toolchain / container pins used by Rake tasks.
 # Mirror any change here into build.sbt and docs/compatibility-matrix.md.
@@ -37,6 +38,7 @@ module Config
   MINIO_ENDPOINT = "http://minio:9000"
   TRINO_CATALOG_TEMPLATE = File.join(ROOT, "infra", "trino", "etc", "catalog", "iceberg.properties.template")
   TRINO_CATALOG_OUTPUT = File.join(ROOT, ".local", "trino", "catalog", "iceberg.properties")
+  PIPELINE_ENV_OUTPUT = File.join(ROOT, ".local", "pipeline.env")
 
   ENV_FILE = File.join(ROOT, ".env")
 
@@ -86,6 +88,34 @@ module Config
 
     FileUtils.mkdir_p(File.dirname(TRINO_CATALOG_OUTPUT))
     File.open(TRINO_CATALOG_OUTPUT, "w", 0o600) { |file| file.write(template) }
+  end
+
+  # Create a one-run env file for the Beam container so credentials are never
+  # embedded in the podman command line or written to a tracked file.
+  def self.render_pipeline_env!(env = load_env!)
+    settings = {
+      "PCL_RUN_ID" => SecureRandom.uuid,
+      "PCL_SOURCE_ID" => env.fetch("PCL_SOURCE_ID"),
+      "PCL_KAFKA_BOOTSTRAP_SERVERS" => env.fetch("PCL_KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
+      "PCL_CDC_TOPIC" => env.fetch("PCL_CDC_TOPIC", "pcl.public.orders"),
+      "PCL_ICEBERG_CATALOG_URI" => env.fetch("PCL_ICEBERG_CATALOG_URI", "http://iceberg-catalog:8181"),
+      "PCL_ICEBERG_WAREHOUSE" => env.fetch(
+        "PCL_ICEBERG_WAREHOUSE",
+        "s3://#{env.fetch('PCL_ICEBERG_BUCKET')}/warehouse/"
+      ),
+      "PCL_MINIO_ENDPOINT" => env.fetch("PCL_MINIO_ENDPOINT", "http://minio:9000"),
+      "PCL_MINIO_REGION" => env.fetch("PCL_MINIO_REGION"),
+      "PCL_MINIO_ROOT_USER" => env.fetch("PCL_MINIO_ROOT_USER"),
+      "PCL_MINIO_ROOT_PASSWORD" => env.fetch("PCL_MINIO_ROOT_PASSWORD"),
+      "PCL_WRITE_FREQUENCY_SECONDS" => env.fetch("PCL_WRITE_FREQUENCY_SECONDS", "10"),
+      "PCL_MAX_RECORDS" => env.fetch("PCL_MAX_RECORDS", "0")
+    }
+
+    FileUtils.mkdir_p(File.dirname(PIPELINE_ENV_OUTPUT))
+    File.open(PIPELINE_ENV_OUTPUT, "w", 0o600) do |file|
+      settings.each { |key, value| file.puts("#{key}=#{value}") }
+    end
+    PIPELINE_ENV_OUTPUT
   end
 end
 

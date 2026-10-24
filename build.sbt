@@ -13,6 +13,8 @@ val Versions = new
   val beam       = "2.76.0"
   val flinkRun   = "2.2"     // Flink runner artifact family (Flink 2.2.x, Beam >= 2.75)
   val iceberg    = "1.11.0"  // kept in sync with the Beam 2.76 Iceberg dependency
+  val kafka      = "3.9.1"   // matches the pinned broker and KafkaIO wire client
+  val hadoop     = "3.3.6"  // Beam IcebergIO loads Hadoop Configuration at runtime
   val scalaTest  = "3.2.19"
 
   // Wire-format parsing for the Debezium envelope lives in the adapter layer,
@@ -35,8 +37,12 @@ libraryDependencies ++= Seq(
   "org.apache.beam" % "beam-runners-direct-java"     % Versions.beam,
   "org.apache.beam" % s"beam-runners-flink-${Versions.flinkRun}" % Versions.beam,
   "org.apache.beam" % "beam-sdks-java-io-kafka"      % Versions.beam,
+  "org.apache.kafka" % "kafka-clients"               % Versions.kafka,
   "org.apache.beam" % "beam-sdks-java-io-iceberg"    % Versions.beam,
+  "org.apache.iceberg" % "iceberg-aws"                % Versions.iceberg,
   "org.apache.iceberg" % "iceberg-aws-bundle"         % Versions.iceberg,
+  "org.apache.hadoop" % "hadoop-client-api"            % Versions.hadoop,
+  "org.apache.hadoop" % "hadoop-client-runtime"        % Versions.hadoop,
   "io.circe" %% "circe-core"                        % Versions.circe,
   "io.circe" %% "circe-parser"                      % Versions.circe,
   "org.scalatest"  %% "scalatest"                    % Versions.scalaTest % Test

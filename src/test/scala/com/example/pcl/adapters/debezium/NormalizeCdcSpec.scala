@@ -97,6 +97,16 @@ class NormalizeCdcSpec extends AnyFlatSpec with Matchers {
     first.eventId should not be second.eventId
   }
 
+  it should "keep snapshot rows distinct when they share one source position" in {
+    val firstJson     = snapshotRow()
+    val secondJson    = snapshotRow().replace("1005", "1006")
+    val Right(first)  = NormalizeCdc.normalize(firstJson, Source)
+    val Right(second) = NormalizeCdc.normalize(secondJson, Source)
+
+    first.sourcePosition shouldBe second.sourcePosition
+    first.eventId should not be second.eventId
+  }
+
   it should "reject a payload that is not JSON" in {
     NormalizeCdc.normalize("{not json", Source) match {
       case Left(rejection) => rejection.reason shouldBe ReasonCode.MalformedJson

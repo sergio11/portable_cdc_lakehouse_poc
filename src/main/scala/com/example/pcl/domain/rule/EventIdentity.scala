@@ -37,14 +37,16 @@ object EventIdentity {
       schemaName: String,
       tableName: String,
       position: SourcePosition,
-      ordinal: Option[Long] = None
+      ordinal: Option[Long] = None,
+      primaryKey: Option[Map[String, String]] = None
   ): String = {
     val base = List(sourceId, schemaName, tableName, position.lsn.toString).mkString(Delim)
 
     val withTx  = position.txId.fold(base)(tx => s"$base${Delim}tx=$tx")
     val withSeq = position.sequenceNo.fold(withTx)(seq => s"$withTx${Delim}seq=$seq")
+    val withKey = primaryKey.fold(withSeq)(key => s"$withSeq${Delim}key=${primaryKeyRef(key)}")
 
-    ordinal.fold(withSeq)(ord => s"$withSeq${Delim}ord=$ord")
+    ordinal.fold(withKey)(ord => s"$withKey${Delim}ord=$ord")
   }
 
   /** Canonical key of a row, used for grouping and for dead-letter context. */

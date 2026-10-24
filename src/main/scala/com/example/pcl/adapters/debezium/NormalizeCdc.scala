@@ -117,7 +117,15 @@ object NormalizeCdc {
         sourcePosition = position,
         sourceTimestamp = envelope.tsMs.getOrElse(0L),
         transactionId = envelope.source.txId.map(_.toString),
-        eventId = EventIdentity.derive(sourceId, schemaName, tableName, position),
+        // PostgreSQL snapshot rows share one LSN/transaction position. Include the canonical key
+        // so distinct rows at that position do not collapse into one event identity.
+        eventId = EventIdentity.derive(
+          sourceId,
+          schemaName,
+          tableName,
+          position,
+          primaryKey = Some(key.values)
+        ),
         schemaVersion = ValidateEvent.SupportedSchemaVersion,
         before = envelope.before,
         after = envelope.after,

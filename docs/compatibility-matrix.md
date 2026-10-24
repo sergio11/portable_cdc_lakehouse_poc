@@ -34,13 +34,13 @@ suites in the pinned image.
 | Component | Version | Validation |
 |---|---|---|
 | Apache Beam SDK | 2.76.0 | Verified |
-| Beam DirectRunner | 2.76.0 | Verified (classpath resolves) |
-| Beam FlinkRunner | 2.76.0 (`beam-runners-flink-2.2`) | Verified (classpath resolves) |
+| Beam DirectRunner | 2.76.0 | Verified (bounded Kafka-to-Iceberg run) |
+| Beam FlinkRunner | 2.76.0 (`beam-runners-flink-2.2`) | Verified (classpath resolves); runtime pending |
 | Apache Flink | 2.2.x | Pending |
 | KafkaIO | 2.76.0 | Verified (classpath resolves) |
 | IcebergIO | 2.76.0 | Verified (classpath resolves) |
-| Apache Iceberg | 1.11.0 | Pending (S3 runtime) |
-| Iceberg AWS bundle | 1.11.0 | Pending (S3 runtime) |
+| Apache Iceberg | 1.11.0 | Verified (Beam IcebergIO write to MinIO) |
+| Iceberg AWS module and bundle | 1.11.0 | Verified (S3FileIO runtime) |
 | ScalaTest | 3.2.19 | Verified |
 
 `beam-sdks-java-io-kafka` references Confluent registry artifacts outside Maven
@@ -72,17 +72,18 @@ builder. The OCI image is local to this POC; it is not an upstream-maintained
 container image. The version and source-build procedure are recorded in
 ADR-008.
 
-The build, S3 bucket bootstrap and Trino Iceberg table writes have been exercised
-with Podman. Beam IcebergIO writes against this MinIO bucket remain pending.
+The build, S3 bucket bootstrap, Trino Iceberg table writes, and Beam IcebergIO
+append have been exercised with Podman. See `docs/poc-runbook.md` for the
+reproducible bounded capture and materialization flow.
 
 ### Iceberg catalog compatibility
 
 Trino 476 does not support HadoopCatalog as an Iceberg catalog type. The stack
 therefore uses the Apache Iceberg REST fixture, backed by a persistent SQLite
 catalog volume. Trino 476 successfully created and listed Iceberg tables through
-the fixture. The application's Iceberg 1.11.0 library and the fixture's
-published 1.10.1 tag still need Beam create/write/read validation. The warehouse
-is `s3://pcl-warehouse/warehouse/` in MinIO. See ADR-009.
+the fixture. Beam Iceberg 1.11.0 successfully appended raw rows through the same
+catalog and MinIO warehouse; Trino read the resulting snapshot. The warehouse is
+`s3://pcl-warehouse/warehouse/` in MinIO. See ADR-009.
 
 ### Kafka addressing
 
