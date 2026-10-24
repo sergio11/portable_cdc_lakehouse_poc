@@ -1,10 +1,10 @@
 # Portable CDC Lakehouse — Engineering POC
 
-A local, reproducible CDC lakehouse that captures PostgreSQL changes, normalizes them with Scala on the Apache Beam Java SDK, stores append-only history in Apache Iceberg on MinIO, and materializes an auditable current-state table.
+A local, reproducible CDC lakehouse experiment that captures PostgreSQL changes, normalizes them with Scala on the Apache Beam Java SDK, stores append-only history in Apache Iceberg on MinIO, and materializes an auditable current-state table.
 
-The POC exercises the same Beam graph with DirectRunner and with the classic FlinkRunner on a separate Flink JobManager and TaskManager. It is an engineering demonstration, not a production-certified data platform.
+This open-source POC exercises the same Beam graph with DirectRunner and with the classic FlinkRunner on a separate Flink JobManager and TaskManager. It is an engineering experiment, not a production-certified data platform.
 
-> **Current status:** the local stack, bounded Beam-to-Iceberg flow, Flink cluster submission, current-state materialization, and isolated replay are implemented and have runtime evidence. Some SRS acceptance and recovery scenarios remain open; see [SRS status](#srs-completion-status).
+> **Current status:** the local stack, bounded Beam-to-Iceberg flow, Flink cluster submission, current-state materialization, and isolated replay are implemented and have runtime evidence. Some integration, portability-comparison, and recovery scenarios remain experimental; see [POC validation status](#poc-validation-status).
 
 ## What this POC demonstrates
 
@@ -87,14 +87,14 @@ sequenceDiagram
 
 | Technology | Role | Why it is used here |
 |---|---|---|
-| Scala 2.13 on Beam Java SDK 2.76 | Pipeline code and common transformations | Meets the SRS language choice while using Beam's JVM API. Beam does not provide a separate official Scala SDK; Scala/JVM serialization and runner compatibility are explicit validation concerns. |
+| Scala 2.13 on Beam Java SDK 2.76 | Pipeline code and common transformations | Keeps the pipeline on Beam's JVM API while allowing the implementation to be written in Scala. Beam does not provide a separate official Scala SDK, so Scala/JVM serialization and runner compatibility are explicit validation concerns. |
 | DirectRunner | Local runner | Gives a low-friction path to execute the bounded fixture without a cluster. |
 | Flink 2.2.1 + classic FlinkRunner | Distributed runner | Demonstrates a JVM job submitted to a real local JobManager/TaskManager cluster using the same Beam graph. |
 | PostgreSQL 17 | Operational source | Provides a familiar relational source and logical WAL for CDC. |
 | Debezium 3.2 + Kafka Connect | CDC capture | Converts PostgreSQL WAL changes and snapshots into a standard Kafka topic. |
 | Kafka 3.9.1 (KRaft) | Durable event transport | Separates source capture from Beam consumption without adding ZooKeeper to this single-node POC. |
 | Apache Iceberg 1.11 | Raw history and table format | Provides append history, table snapshots, and a versioned current-state table on object storage. |
-| MinIO | S3-compatible object storage | Required by the SRS; lets Beam and Trino share one local object-store endpoint. The pinned upstream MinIO release is built locally because the upstream community image is no longer published. |
+| MinIO | S3-compatible object storage | Gives Beam and Trino one local object-store endpoint using the S3 API. The pinned upstream MinIO release is built locally because the upstream community image is no longer published. |
 | Iceberg REST fixture 1.10.1 + SQLite | Shared catalog metadata | Gives Beam and Trino a common REST catalog. SQLite catalog metadata persists in a Podman volume. |
 | Trino 476 | SQL materialization, inspection, and reconciliation | Runs the Iceberg `MERGE` and provides a direct way to inspect state and snapshots. It is also the reason raw-to-silver materialization stays outside the Beam graph. |
 | Podman + Podman Compose | Local services and job containers | Satisfies the container-runtime requirement without Docker Engine and keeps service versions and volumes in `compose.yaml`. |
@@ -197,36 +197,33 @@ Use `bundle exec rake -T` to list the operational tasks. Build and local checks 
 - A bounded classic FlinkRunner job completed in the separate Podman cluster. The recorded run read 15 Kafka records, accepted 13 CDC events, observed 2 tombstones, and wrote one Iceberg snapshot.
 - `rake verify` passed with 54 unit and architecture tests. It does not replace the outstanding integration and recovery scenarios listed below.
 
-## SRS completion status
+## POC validation status
 
-The POC is **not fully closed against the SRS yet**. It demonstrates the core path, but the SRS Definition of Done expects evidence for every AC-01–AC-12 or an explicitly accepted deviation.
+The POC demonstrates the main CDC-to-lakehouse path, but it is **not a complete production validation**. The current evidence and remaining experimental work are summarized here.
 
-| Acceptance criterion | Status | Current evidence / remaining work |
+| Area | Status | Evidence / remaining work |
 |---|---|---|
-| AC-01 CDC capture | Verified | PostgreSQL → Debezium → Kafka fixture exercised. |
-| AC-02 canonical contract and invalid-event route | Partial | Normalization/validation unit-tested and pipeline routes to DLQ; an invalid envelope still needs an end-to-end DLQ assertion. |
-| AC-03 DirectRunner/FlinkRunner equivalence | Partial | Both runners completed bounded jobs; exact logical outputs have not yet been compared from isolated, identical fixture baselines. |
-| AC-04 upsert precedence | Verified for the implemented `orders` materializer | Newer source versions win; reconciliation checks the current projection. |
-| AC-05 delete/tombstone | Verified for the implemented fixture | Deletes persist as tombstones; delete-then-reinsert and stale-event rules are covered by domain logic. |
-| AC-06 idempotency | Partial | Domain and materializer idempotency are tested; duplicate delivery is not yet an automated end-to-end scenario and raw remains append-only. |
-| AC-07 replay reconstruction | Partial | Isolated full/LSN-range replay exists; compare the replay result to the expected reference, including values and tombstones, as a repeatable acceptance check. |
-| AC-08 recovery after restart | Pending | Checkpoint/offset and failure-window restart scenarios have not been validated. |
-| AC-09 Iceberg snapshots | Verified | Trino can inspect Iceberg tables and snapshots; Beam writes through MinIO. |
-| AC-10 Podman operation | Verified | Rake start/status/logs/stop/reset commands and operating instructions are included in this README. |
-| AC-11 manual execution | Verified | Build, tests, runners, materialization, replay, and reconciliation are manual Rake tasks. |
-| AC-12 documentation and limitations | In progress | This README now consolidates architecture, version pins, commands, decisions, evidence, and known gaps; remaining acceptance evidence is still open. |
+| CDC capture | Demonstrated | PostgreSQL → Debezium → Kafka fixture exercised. |
+| Canonical contract and validation | Unit-tested; integration pending | Normalization/validation is unit-tested and the Beam graph routes invalid envelopes to DLQ; an invalid input still needs an end-to-end assertion. |
+| DirectRunner and FlinkRunner | Both execute; comparison pending | Bounded jobs completed on both. Compare their logical outputs using isolated, identical fixture baselines. |
+| Current-state upsert and delete | Demonstrated for `orders` | Newer source positions win; deletes persist as tombstones; reconciliation inspects the projection. |
+| Idempotency and duplicates | Partial | Domain and materializer idempotency are implemented; duplicate delivery is not yet an automated end-to-end scenario, and raw remains append-only. |
+| Replay reconstruction | Implemented; result check pending | Isolated full/LSN-range replay exists. Compare replay keys, business values, and tombstones with an expected reference. |
+| Recovery after restart | Not validated | Checkpoint/offset and failure-window restart behavior have not been tested. |
+| Iceberg and Podman operations | Demonstrated | Trino inspects tables and snapshots; Rake commands cover start/status/logs/stop/reset. |
+| Observability and performance | Partial | Available counters and SQL reports cover part of the pipeline. Complete duplicate/obsolete/commit counters and record a synthetic throughput/duration measurement. |
 
-### Remaining SRS work
+### Remaining experimental work
 
 1. Add deterministic duplicate and out-of-order fixture scenarios; prove snapshot-versus-WAL precedence on an isolated dataset.
 2. Add an integration check that injects an invalid Debezium envelope and asserts its reason and payload in `ops.cdc_dead_letter`.
 3. Compare DirectRunner and FlinkRunner outputs against the same fixture baseline, then reconcile both.
 4. Reconcile a replay target by keys, business values, and tombstones; associate the replay ID with the result evidence.
 5. Exercise restart/failure windows and define checkpoint/offset behavior. The POC does not claim end-to-end exactly-once.
-6. Complete observability for duplicate, obsolete, commit, and discrepancy counters; current logs/counters and SQL reports cover only part of FR-017.
-7. Record a documented synthetic-load duration/throughput measurement for NFR-007. No production SLA is implied.
+6. Complete observability for duplicate, obsolete, commit, and discrepancy counters; current logs/counters and SQL reports cover only part of the pipeline.
+7. Record a documented synthetic-load duration/throughput measurement. No production SLA is implied.
 
-CI/CD, production cloud deployment, HA, Kubernetes, and a production SLA are excluded by the SRS.
+CI/CD, production cloud deployment, HA, Kubernetes, and a production SLA are outside this experiment's scope.
 
 ## Strengths and trade-offs
 
