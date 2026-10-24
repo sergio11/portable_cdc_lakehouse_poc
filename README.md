@@ -66,7 +66,7 @@ flowchart LR
 
 1. PostgreSQL writes changes to its logical WAL. Debezium reads those changes and publishes envelopes to Kafka.
 2. Beam reads the topic, ignores Kafka's null-value delete markers, normalizes Debezium envelopes, and routes valid events to raw history and invalid envelopes to the dead-letter table.
-3. With DirectRunner, the Beam process executes locally in its temporary container. With FlinkRunner, that container submits the job; Flink executes the Beam operators in the TaskManager. The submitter is removed after a bounded job finishes, while the Flink services remain available for inspection.
+3. With DirectRunner, the Beam process executes locally in its temporary container. With FlinkRunner, that container submits the job and waits while Flink executes Beam operators in the TaskManager. In continuous mode, the submitter and Flink services stay active until the job is stopped.
 4. Trino runs an idempotent `MERGE` from raw history into `silver.orders_current`, keeping the highest source position per order. Deletes become versioned tombstones.
 5. `lakehouse:replay` creates an isolated target table and rebuilds it from all raw events or an inclusive LSN range. It does not update the canonical current-state table.
 6. Trino queries inspect the Iceberg tables, snapshots, counts, and reconciliation discrepancies.
@@ -112,7 +112,7 @@ The pipeline is written in Scala 2.13 using Beam's Java SDK. Beam provides one g
 
 ### 🏃 DirectRunner and FlinkRunner — local and distributed execution
 
-DirectRunner is useful for a quick local bounded run and functional checks. The classic FlinkRunner submits the same JVM graph to the local Flink JobManager; Flink schedules and executes the operators in the TaskManager. This makes the distributed runtime visible in Podman while keeping the business transforms shared. A separate Beam worker service is not required for this classic JVM runner. Both modes have completed bounded runs, though an isolated result-by-result equivalence comparison is still open.
+DirectRunner executes the graph locally and is useful during development. The classic FlinkRunner submits the same JVM graph to the local Flink JobManager; Flink schedules and executes the operators in the TaskManager. This makes the persistent distributed runtime visible in Podman while keeping the business transforms shared. A separate Beam worker service is not required for this classic JVM runner. The continuous Flink job has been verified running; result-by-result equivalence between runners remains open.
 
 ### 🧊 Apache Iceberg — open table format
 
@@ -196,8 +196,14 @@ $ bundle exec rake infra:status
 8 containers running: PostgreSQL, Kafka, MinIO, Iceberg REST, Trino,
 Kafka Connect, Flink JobManager, and Flink TaskManager
 
-$ Flink REST: GET /jobs/d0aaab107904874e180ef56c5c452cb7
-state=FINISHED  duration=91.9s  tasks=8/8 finished  failed=0
+$ PCL_MAX_RECORDS=0 bundle exec rake pipeline:flink
+{"component":"CdcStreamingPipeline", ... ,"status":"running"}
+
+$ Flink REST after 90 seconds
+state=RUNNING  tasks=5/5 running  failed=0
+
+$ bundle exec rake pipeline:flink:stop (second PowerShell window)
+Flink JobManager and TaskManager stopped
 
 $ bundle exec rake lakehouse:materialize
 Current-state projection refreshed (query 20261024_130008_00003_22msk).
@@ -212,7 +218,7 @@ $ PCL_REPLAY_ID=readme_proof bundle exec rake lakehouse:replay
 7 keys, 1 tombstone (query 20261024_130215_00011_22msk)
 ```
 
-The captured distributed Beam run consumed 15 Kafka records, accepted 13 CDC events, observed 2 Kafka tombstones, and wrote one Iceberg snapshot. That evidence run was bounded and finished; the Quick start above uses the unbounded mode. Replay materialized into its own table, leaving the canonical projection untouched.
+Replay materialized into its own table, leaving the canonical projection untouched.
 
 ## 🔎 What this evidence proves
 
