@@ -165,7 +165,7 @@ Ordering uses LSN and transaction/sequence tie-breakers where available. Event t
 
 ## 🚀 Quick start
 
-From Windows PowerShell, copy `.env.example` to `.env`, set the local passwords, then run:
+From Windows PowerShell, copy `.env.example` to `.env` and set the local PostgreSQL and MinIO passwords. Start the services and prepare the CDC source:
 
 ```powershell
 Copy-Item .env.example .env
@@ -174,12 +174,18 @@ bundle exec rake infra:up
 bundle exec rake lakehouse:init
 bundle exec rake debezium:register
 bundle exec rake fixtures:scenarios
-$env:PCL_MAX_RECORDS = '20'; bundle exec rake pipeline:flink; Remove-Item Env:PCL_MAX_RECORDS
-bundle exec rake lakehouse:materialize
-bundle exec rake query:file[sql/reconciliation.sql]
 ```
 
-Open the Flink dashboard at [localhost:8081](http://localhost:8081). Stop the stack with `bundle exec rake infra:down`.
+Launch the unbounded Beam job. It keeps reading CDC events from Kafka and writing them to Iceberg until you stop the Flink cluster:
+
+```powershell
+$env:PCL_MAX_RECORDS = '0'
+bundle exec rake pipeline:flink
+```
+
+This command stays attached while the job runs. Open the Flink dashboard at [localhost:8081](http://localhost:8081). To stop the job from a second PowerShell window, run `bundle exec rake pipeline:flink:stop`.
+
+The `silver.orders_current` projection is refreshed separately; in a second window, run `bundle exec rake lakehouse:materialize` when you want to update it, then inspect it with `bundle exec rake query:file[sql/reconciliation.sql]`.
 
 ## 📸 Results from the running POC
 
@@ -206,7 +212,7 @@ $ PCL_REPLAY_ID=readme_proof bundle exec rake lakehouse:replay
 7 keys, 1 tombstone (query 20261024_130215_00011_22msk)
 ```
 
-The distributed Beam run consumed 15 Kafka records, accepted 13 CDC events, observed 2 Kafka tombstones, and wrote one Iceberg snapshot. Replay materialized into its own table, leaving the canonical projection untouched.
+The captured distributed Beam run consumed 15 Kafka records, accepted 13 CDC events, observed 2 Kafka tombstones, and wrote one Iceberg snapshot. That evidence run was bounded and finished; the Quick start above uses the unbounded mode. Replay materialized into its own table, leaving the canonical projection untouched.
 
 ## 🔎 What this evidence proves
 
