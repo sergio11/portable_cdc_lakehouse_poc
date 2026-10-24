@@ -100,6 +100,24 @@ sequenceDiagram
 | Podman + Podman Compose | Local services and job containers | Satisfies the container-runtime requirement without Docker Engine and keeps service versions and volumes in `compose.yaml`. |
 | Rake | Manual task interface | Encapsulates build, readiness, environment-file generation, pipeline submission, replay, and cleanup behind repeatable commands. Rake tasks are orchestration commands, not extra runtime services. |
 
+### Pinned versions and validation
+
+| Component | Version | Validation |
+|---|---|---|
+| Podman / podman-compose | 5.8.2 / 1.5.0 | Local stack started and exercised |
+| Build image / JDK | `scala-sbt:eclipse-temurin-21.0.12_8_1.13.0_2.13.18` / Temurin 21.0.12+8 | Build and test gate |
+| Scala / sbt | 2.13.18 / 1.13.0 | Compile and tests |
+| Apache Beam / DirectRunner | 2.76.0 | Bounded Kafka-to-Iceberg run |
+| Beam FlinkRunner / Apache Flink | 2.76.0 (`beam-runners-flink-2.2`) / 2.2.1 | Bounded job completed on Podman JobManager and TaskManager |
+| PostgreSQL / Kafka | 17.2 / 3.9.1 | Source CDC and topic exercised |
+| Debezium Connect | 3.2.4.Final | PostgreSQL connector task reached RUNNING |
+| Apache Iceberg / Iceberg REST fixture | 1.11.0 / 1.10.1 | Beam write, Trino read, REST catalog shared |
+| Trino | 476 | Table creation, materialization, and SQL inspection |
+| MinIO | `RELEASE.2025-10-15T17-29-55Z`, built with Go 1.24.8 | Bucket and Iceberg object writes exercised |
+| AWS CLI | 2.27.41 | MinIO bucket bootstrap |
+
+The FlinkRunner artifact family matches Flink 2.2.x, and [Beam's compatibility table](https://beam.apache.org/documentation/runners/flink/) lists support for Beam 2.75.0 and later with that runner family. The compatibility evidence above is specific to this local pinned stack; it does not claim production-cluster validation.
+
 ## Data model and semantics
 
 | Table | Purpose | Important behavior |
@@ -113,7 +131,7 @@ Ordering uses LSN and transaction/sequence tie-breakers where available. Event t
 
 ## Quick start
 
-The commands below are for Windows PowerShell from the repository root. The [runbook](docs/poc-runbook.md) includes setup notes and replay details.
+The commands below are for Windows PowerShell from the repository root. This README contains setup, replay, and operational instructions.
 
 ```powershell
 Copy-Item .env.example .env
@@ -194,9 +212,9 @@ The POC is **not fully closed against the SRS yet**. It demonstrates the core pa
 | AC-07 replay reconstruction | Partial | Isolated full/LSN-range replay exists; compare the replay result to the expected reference, including values and tombstones, as a repeatable acceptance check. |
 | AC-08 recovery after restart | Pending | Checkpoint/offset and failure-window restart scenarios have not been validated. |
 | AC-09 Iceberg snapshots | Verified | Trino can inspect Iceberg tables and snapshots; Beam writes through MinIO. |
-| AC-10 Podman operation | Verified | Rake start/status/logs/stop/reset commands and runbook are provided. |
+| AC-10 Podman operation | Verified | Rake start/status/logs/stop/reset commands and operating instructions are included in this README. |
 | AC-11 manual execution | Verified | Build, tests, runners, materialization, replay, and reconciliation are manual Rake tasks. |
-| AC-12 documentation and limitations | In progress | This README, runbook, ADRs, and compatibility matrix exist; remaining evidence and gaps are listed here. |
+| AC-12 documentation and limitations | In progress | This README now consolidates architecture, version pins, commands, decisions, evidence, and known gaps; remaining acceptance evidence is still open. |
 
 ### Remaining SRS work
 
@@ -232,9 +250,6 @@ sql/materialize_orders.sql           Idempotent current-state MERGE
 sql/reconciliation.sql               Counts, tombstones, and discrepancy report
 infra/fixtures/                      Deterministic PostgreSQL CDC mutations
 rakelib/                             Build, infrastructure, pipeline, replay, and query tasks
-docs/poc-runbook.md                  Detailed operating procedure
-docs/compatibility-matrix.md         Pinned versions and runtime evidence
-docs/decisions/                      Architecture decision records
 ```
 
 ## License
