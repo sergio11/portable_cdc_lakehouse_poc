@@ -1,0 +1,20 @@
+# Build the official MinIO source release locally because upstream no longer
+# publishes community container images. Keep release and builder pins explicit.
+ARG GO_BUILDER_IMAGE=docker.io/library/golang:1.24.8-bookworm
+FROM ${GO_BUILDER_IMAGE} AS build
+
+ARG MINIO_VERSION=RELEASE.2025-10-15T17-29-55Z
+ENV CGO_ENABLED=0
+
+RUN go install -v "github.com/minio/minio@${MINIO_VERSION}"
+
+FROM docker.io/library/debian:bookworm-slim
+
+# MinIO discovers its default config directory by calling `getent`; scratch
+# images lack that utility and make the server exit before binding its ports.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libc-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /go/bin/minio /usr/bin/minio
+ENTRYPOINT ["/usr/bin/minio"]

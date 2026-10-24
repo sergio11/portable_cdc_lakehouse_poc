@@ -16,9 +16,9 @@ $stderr.sync = true
 # Task bodies reference them lazily at invocation time, so definition order is safe.
 
 # Fail fast, loudly and with a non-zero exit code. No `|| true`, no swallowing.
-def run!(*cmd, chdir: Config::ROOT)
+def run!(*cmd, chdir: Config::ROOT, environment: {})
   puts "\n$ #{cmd.join(' ')}"
-  success = system(*cmd, chdir: chdir)
+  success = system(environment, *cmd, chdir: chdir)
   abort("Command failed: #{cmd.join(' ')}") unless success
 end
 

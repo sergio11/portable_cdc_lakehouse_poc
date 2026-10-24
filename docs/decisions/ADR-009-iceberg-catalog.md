@@ -1,44 +1,31 @@
-# ADR-009 — Iceberg catalog: HadoopCatalog over a shared volume
+# ADR-009 — Iceberg REST catalog backed by SQLite
 
 - **Status:** Accepted
-- **Date:** 2026-10-17
+- **Date:** 2026-10-24
 
 ## Context
 
-The SRS calls for an Iceberg catalog as a distinct service (SRS 2.1 item 8,
-10.1 `iceberg-catalog`). The conventional choice for a local POC is the Iceberg
-REST catalog, which both Beam's `IcebergIO` and Trino's Iceberg connector
-support as a first-class integration.
-
-There is no published container image for it. Verified against Docker Hub:
-
-- `apache/iceberg-rest` — does not exist.
-- `apache/iceberg-rest-catalog` — does not exist.
-- `tabularium/iceberg-rest-catalog` — does not exist.
-
-Running a REST catalog would therefore mean building or third-party-pulling an
-image, which adds an unpinnable dependency to a project whose central claim is
-reproducibility.
+Trino 476 does not support HadoopCatalog as an Iceberg catalog type. The POC
+needs one catalog endpoint that both the Beam JVM application and Trino can
+use, while keeping table data and metadata files in MinIO.
 
 ## Decision
 
-Use Iceberg's **HadoopCatalog** with the warehouse root at `/warehouse` on the
-shared `iceberg_warehouse` volume. HadoopCatalog keeps catalog metadata (table
-pointers, schemas, snapshots) inside the warehouse directory itself, so there is
-no separate service to run, pin or secure.
-
-Beam's own `IcebergIO` documentation presents HadoopCatalog as the recommended
-path for local development.
-
-Trino reaches the same catalog through its `hadoop` catalog type in
-`infra/trino/etc/catalog/iceberg.properties`.
+Use Apache Iceberg's REST catalog fixture image `1.10.1`, pinned to the latest
+published versioned tag, with a SQLite `JdbcCatalog` database persisted on the
+`iceberg_catalog_data` Podman volume. Configure the catalog's Iceberg AWS
+FileIO to write to `s3://pcl-warehouse/warehouse/` in MinIO. Beam and Trino
+connect to the same REST endpoint; Trino accesses the same S3 files using its
+native S3 filesystem support.
 
 ## Consequences
 
-- Catalog state is not independently queryable over JDBC. Reconciliation and
-  snapshot inspection therefore go through Trino's Iceberg connector and the
-  Iceberg Java API, both of which are already part of the design.
-- `iceberg.hadoop-catalog.warehouse` must point at the same absolute path in
-  every component. `Config::WAREHOUSE_PATH` documents this invariant.
-- If a REST or JDBC catalog is ever required, only the catalog implementation and
-  its connection properties change; table layouts and pipeline code do not.
+- Catalog metadata is shared through an explicit REST service instead of local
+  catalog paths.
+- The fixture is a POC catalog service; SQLite persistence and a single node
+  are not production availability guarantees.
+- The Iceberg Java library in the application is version 1.11.0 while the
+  published fixture is 1.10.1. Compatibility must be verified by creating and
+  querying tables through both clients before it is marked verified.
+- Bucket, endpoint, region and credentials are configurable outside business
+  logic; local secrets are written only to `.env` and the ignored Trino file.

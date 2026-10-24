@@ -11,10 +11,8 @@
 #     joins this network and therefore uses the same value; publishing the port
 #     would force an advertised-listener split between host and container
 #     clients, which is a classic source of silent misconfiguration.
-#   * The Iceberg warehouse is a local filesystem managed by Iceberg's
-#     HadoopCatalog. It is mounted at the SAME path (/warehouse) in every
-#     container that touches it, because catalog metadata and data files are
-#     addressed by that path. Do not remap it per service.
+#   * MinIO provides S3-compatible object storage for the Iceberg warehouse.
+#     Beam and Trino use the same endpoint, bucket and credentials.
 #   * Postgres runs with logical WAL decoding enabled for Debezium.
 #
 # Usage is always through Rake (`rake infra:up`), never by calling
@@ -90,6 +88,42 @@ services:
       retries: 12
       start_period: 20s
 
+  minio:
+    image: localhost/pcl-minio:RELEASE.2025-10-15T17-29-55Z
+    build:
+      context: ./infra/minio
+      dockerfile: Containerfile
+      args:
+        MINIO_VERSION: RELEASE.2025-10-15T17-29-55Z
+        GO_BUILDER_IMAGE: docker.io/library/golang:1.24.8-bookworm
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${PCL_MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${PCL_MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:${PCL_MINIO_API_PORT}:9000"
+      - "127.0.0.1:${PCL_MINIO_CONSOLE_PORT}:9001"
+
+  iceberg-catalog:
+    image: docker.io/apache/iceberg-rest-fixture:1.10.1
+    container_name: pcl-iceberg-catalog
+    environment:
+      AWS_ACCESS_KEY_ID: ${PCL_MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${PCL_MINIO_ROOT_PASSWORD}
+      AWS_REGION: ${PCL_MINIO_REGION}
+      CATALOG_CATALOG_NAME: pcl
+      CATALOG_URI: jdbc:sqlite:/catalog/iceberg_catalog.db?journal_mode=WAL
+      CATALOG_WAREHOUSE: s3://${PCL_ICEBERG_BUCKET}/warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    volumes:
+      - iceberg_catalog_data:/catalog:U
+    ports:
+      - "127.0.0.1:${PCL_ICEBERG_CATALOG_PORT}:8181"
+
   connect:
     image: quay.io/debezium/connect:3.2.4.Final
     container_name: pcl-connect
@@ -115,16 +149,23 @@ services:
     image: docker.io/trinodb/trino:476
     container_name: pcl-trino
     volumes:
-      # Iceberg catalog definitions (Trino <-> Iceberg wiring).
-      - ./infra/trino/etc/catalog:/etc/trino/catalog:ro
-      # The Iceberg warehouse, at the identical path used by every other service.
-      - iceberg_warehouse:/warehouse
+      # Generated from the local .env; contains credentials and is gitignored.
+      - ./.local/trino/catalog:/etc/trino/catalog:ro
       - trino_data:/var/lib/trino/data
     ports:
       - "127.0.0.1:${PCL_TRINO_PORT}:8080"
+    healthcheck:
+      # Trino takes longer to initialise its Iceberg connector on this small
+      # single-node POC than the upstream image's 10 second startup window.
+      test: ["CMD-SHELL", "/usr/lib/trino/bin/health-check"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 120s
 
 volumes:
   postgres_data:
   kafka_data:
-  iceberg_warehouse:
+  minio_data:
+  iceberg_catalog_data:
   trino_data:

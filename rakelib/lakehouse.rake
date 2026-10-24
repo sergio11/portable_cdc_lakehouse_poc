@@ -69,6 +69,7 @@ namespace :lakehouse do
   desc "Create the Iceberg schemas and tables (raw / silver / ops)"
   task :init do
     env = Config.load_env!
+    Infra.ensure_iceberg_bucket!(env)
     path = File.join(Config::ROOT, "sql", "bootstrap_catalog.sql")
     result = Trino.execute_file(path, env)
 
@@ -124,7 +125,7 @@ namespace :query do
     abort("SQL file not found: #{relative}") unless File.exist?(full)
 
     sql = File.read(full)
-    result = Trino.execute(sql, env)
+    result = Trino.execute_file(full, env)
 
     puts sql.strip
     puts "\n-- result"

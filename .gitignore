@@ -17,6 +17,7 @@ vendor/bundle/
 .env
 .env.*
 !.env.example
+.local/
 
 # --- IDE ---
 .idea/

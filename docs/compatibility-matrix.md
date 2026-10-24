@@ -1,19 +1,18 @@
 # Compatibility Matrix
 
-Every version used by the POC is pinned and verified as a *set*. A change to any
-entry here requires re-running `rake verify` and, for runtime components,
-the corresponding integration or portability test.
+Every version used by the POC is pinned and verified as a set. A change to an
+entry requires re-running `rake verify` and the relevant integration or
+portability checks.
 
-Legend for **Validation**:
+Validation states:
 
 - **Verified** — exercised in this repository with evidence below.
-- **Pending** — resolved/locked but not yet executed at runtime; the phase that
-  proves it is named.
+- **Pending** — resolved and pinned, but runtime validation remains outstanding.
 
 ## 1. JVM toolchain
 
-The toolchain never touches the host: every build and run happens inside a
-pinned container invoked by Rake. No local JVM, sbt or Scala install is required.
+The toolchain runs in containers invoked by Rake. No host JVM, sbt or Scala
+installation is required.
 
 | Component | Version | Validation |
 |---|---|---|
@@ -24,109 +23,83 @@ pinned container invoked by Rake. No local JVM, sbt or Scala install is required
 | JDK | Eclipse Temurin 21.0.12+8 | Verified |
 | sbt | 1.13.0 | Verified |
 | Scala | 2.13.18 | Verified |
-| Ruby (orchestration) | 3.4.5 | Verified |
-| Rake | 13.4.2 (pinned in `Gemfile.lock`) | Verified |
+| Ruby | 3.4.5 | Verified |
+| Rake | 13.4.2 | Verified |
 
-Evidence: `rake verify` compiles all sources and runs the domain plus
-architecture suites inside the image.
+Evidence: `rake verify` compiles the sources and runs the domain and architecture
+suites in the pinned image.
 
 ## 2. Data plane libraries
 
 | Component | Version | Validation |
 |---|---|---|
 | Apache Beam SDK | 2.76.0 | Verified |
-| Beam DirectRunner | 2.76.0 (`beam-runners-direct-java`) | Verified |
+| Beam DirectRunner | 2.76.0 | Verified (classpath resolves) |
 | Beam FlinkRunner | 2.76.0 (`beam-runners-flink-2.2`) | Verified (classpath resolves) |
-| Apache Flink | 2.2.x | Pending — Phase 6 |
-| KafkaIO connector | 2.76.0 (`beam-sdks-java-io-kafka`) | Verified (resolves) |
-| IcebergIO connector | 2.76.0 (`beam-sdks-java-io-iceberg`) | Verified (resolves) |
-| Apache Iceberg | 1.11.0 | Pending — Phase 3 |
+| Apache Flink | 2.2.x | Pending |
+| KafkaIO | 2.76.0 | Verified (classpath resolves) |
+| IcebergIO | 2.76.0 | Verified (classpath resolves) |
+| Apache Iceberg | 1.11.0 | Pending (S3 runtime) |
+| Iceberg AWS bundle | 1.11.0 | Pending (S3 runtime) |
 | ScalaTest | 3.2.19 | Verified |
 
-### Why the Confluent resolver is declared
+`beam-sdks-java-io-kafka` references Confluent registry artifacts outside Maven
+Central, so `build.sbt` declares the Confluent resolver explicitly.
 
-`beam-sdks-java-io-kafka` transitively references
-`io.confluent:kafka-schema-registry-client` and `io.confluent:kafka-avro-serializer`,
-which are published to Confluent's own repository rather than Maven Central.
-Beam declares the resolver in its own build but does not propagate it to
-consumers, so `build.sbt` restates it. Without this, dependency resolution fails
-with `ResolveException`.
-
-### JDK floor
-
-IcebergIO is built against Iceberg 1.11.0 and therefore requires **JDK 17+**.
-The pinned JDK 21 satisfies this.
+IcebergIO requires JDK 17 or newer; the pinned JDK 21 satisfies that floor.
 
 ## 3. Infrastructure services
 
-Every image tag below was verified against its registry before being pinned. No
-`latest` tags are permitted anywhere in the configuration.
+Every service uses a pinned image tag or source release. No `latest` tag is used
+by the reproducible configuration.
 
-| Service | Image / tag | Validation |
+| Service | Image / source | Validation |
 |---|---|---|
-| PostgreSQL | `docker.io/library/postgres:17.2-bookworm` | Registry verified — runtime Pending (Phase 1) |
-| Kafka (KRaft, single node) | `docker.io/apache/kafka:3.9.1` | Registry verified — runtime Pending (Phase 1) |
-| Debezium / Connect | `docker.io/debezium/connect:3.2.4.Final` | Registry verified — runtime Pending (Phase 1) |
-| Trino (SQL inspection) | `docker.io/trinodb/trino:476` | Registry verified — runtime Pending (Phase 1) |
-| Apache Iceberg | 1.11.0 (via Beam) | Runtime Pending — Phase 3 |
-| Iceberg catalog | HadoopCatalog on shared volume | ADR-009 |
-| Object storage | Local filesystem volume | ADR-008 — MinIO withdrawn upstream |
+| PostgreSQL | `postgres:17.2-bookworm` | Verified (connector source and fixtures) |
+| Kafka (KRaft) | `apache/kafka:3.9.1` | Verified (broker and CDC topic) |
+| Debezium Connect | `debezium/connect:3.2.4.Final` | Verified (connector task RUNNING) |
+| Trino | `trinodb/trino:476` | Verified (REST query and catalog startup) |
+| MinIO | Official source `RELEASE.2025-10-15T17-29-55Z`, built with Go 1.24.8 | Verified (source build, S3 API, bucket and Iceberg table writes) |
+| Iceberg REST catalog | `apache/iceberg-rest-fixture:1.10.1` | Verified (Trino create/list tables) |
+| AWS CLI bucket bootstrap | `amazon/aws-cli:2.27.41` | Verified (bucket creation and probe) |
 
-### Object storage: MinIO is no longer publishable
+### MinIO source build
 
-The SRS specifies MinIO as the S3-compatible store. MinIO Inc. moved the
-community edition to a *source-only* distribution in October 2025 and withdrew
-the official images from Docker Hub and quay.io. Verified from this machine:
+MinIO is required by the SRS. Upstream archived its repository on 25 April 2026
+and stopped publishing community container images. The final upstream security
+release, `RELEASE.2025-10-15T17-29-55Z`, is built locally with a pinned Go 1.24.8
+builder. The OCI image is local to this POC; it is not an upstream-maintained
+container image. The version and source-build procedure are recorded in
+ADR-008.
 
-- `docker.io/minio/minio` → **401 Unauthorized** for every tag
-- `quay.io/minio/minio` → pulls refused
-- Last published image: `RELEASE.2025-09-07T16-13-09Z`
+The build, S3 bucket bootstrap and Trino Iceberg table writes have been exercised
+with Podman. Beam IcebergIO writes against this MinIO bucket remain pending.
 
-Third-party mirrors exist but were rejected as a supply-chain liability. The
-warehouse therefore uses a local filesystem volume with HadoopCatalog; see
-`docs/decisions/ADR-008-object-storage.md`.
+### Iceberg catalog compatibility
 
-### Iceberg REST catalog: no published image
-
-A REST catalog was the preferred design, but no such image is published:
-
-- `apache/iceberg-rest` → does not exist
-- `apache/iceberg-rest-catalog` → does not exist
-- `tabularium/iceberg-rest-catalog` → does not exist
-
-HadoopCatalog is used instead, which is the path Beam's own `IcebergIO`
-documentation recommends for local development. See
-`docs/decisions/ADR-009-iceberg-catalog.md`.
-
-### Why Trino instead of DuckDB
-
-Trino's Iceberg connector supports the `hadoop` catalog type and the filesystem
-warehouse as first-class, documented configurations. DuckDB's Iceberg extension
-is less certain for a non-REST catalog, and the POC cannot launch containers to
-empirically validate that path, so the lower-risk engine was chosen.
+Trino 476 does not support HadoopCatalog as an Iceberg catalog type. The stack
+therefore uses the Apache Iceberg REST fixture, backed by a persistent SQLite
+catalog volume. Trino 476 successfully created and listed Iceberg tables through
+the fixture. The application's Iceberg 1.11.0 library and the fixture's
+published 1.10.1 tag still need Beam create/write/read validation. The warehouse
+is `s3://pcl-warehouse/warehouse/` in MinIO. See ADR-009.
 
 ### Kafka addressing
 
-Kafka advertises only `kafka:9092` and is deliberately **not** published to the
-host. A single advertised address avoids the classic split where host clients and
-container clients need different values. The Beam application joins the
-`pcl_default` Compose network and uses the same address.
+Kafka advertises only `kafka:9092` and is not published to the host. The Beam
+application joins the `pcl_default` Compose network and uses this same address.
 
-## 4. Known risk: Flink and the lz4 capability conflict
+## 4. Known Flink dependency risk
 
-Beam release notes for Flink 2.1+ warn that Flink ships
-`at.yawk.lz4:lz4-java` while Kafka clients depend on `org.lz4:lz4-java`; both
-declare the `lz4-java` capability, which Gradle resolves as a capability conflict.
-Phase 6 must either relocate one of them or confirm the sbt classpath is
-unaffected. This is called out explicitly in `docs/decisions/` when resolved.
+Beam's FlinkRunner may encounter an `lz4-java` capability conflict between
+Flink's `at.yawk.lz4:lz4-java` and Kafka's `org.lz4:lz4-java`. The portability
+phase must confirm whether sbt's classpath is affected and record the outcome.
 
 ## 5. Environment notes
 
-- Builds write to named volumes (`pcl-build-target`, `pcl-build-project`) rather
-  than the bind-mounted working tree. The Windows/WSL bind mount rejects the
-  file-timestamp writes sbt performs in its incremental caches, and native
-  volumes are substantially faster.
-- Coursier is mounted as a persistent volume. Without it every invocation
-  re-verifies the full Beam/Flink/Iceberg classpath.
-- The Podman machine used during development is a 4-CPU, 6 GiB WSL instance;
-  absolute timings are not a meaningful performance signal for this POC.
+- sbt build outputs and Coursier caches use Podman named volumes to avoid slow
+  or incompatible Windows/WSL bind-mounted timestamp updates.
+- The Podman machine used during development has 4 CPUs and about 6 GiB RAM;
+  absolute timings are not a performance measure for this POC.
+- `.env` and the generated Trino catalog under `.local/` contain local secrets
+  and remain untracked.

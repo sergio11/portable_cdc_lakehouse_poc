@@ -36,6 +36,7 @@ libraryDependencies ++= Seq(
   "org.apache.beam" % s"beam-runners-flink-${Versions.flinkRun}" % Versions.beam,
   "org.apache.beam" % "beam-sdks-java-io-kafka"      % Versions.beam,
   "org.apache.beam" % "beam-sdks-java-io-iceberg"    % Versions.beam,
+  "org.apache.iceberg" % "iceberg-aws-bundle"         % Versions.iceberg,
   "io.circe" %% "circe-core"                        % Versions.circe,
   "io.circe" %% "circe-parser"                      % Versions.circe,
   "org.scalatest"  %% "scalatest"                    % Versions.scalaTest % Test

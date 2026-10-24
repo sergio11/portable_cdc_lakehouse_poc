@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "fileutils"
+
 # Single source of truth for toolchain / container pins used by Rake tasks.
 # Mirror any change here into build.sbt and docs/compatibility-matrix.md.
 module Config
@@ -26,11 +28,15 @@ module Config
   KAFKA_IMAGE    = "docker.io/apache/kafka:3.9.1"
   DEBEZIUM_IMAGE = "quay.io/debezium/connect:3.2.4.Final"
   TRINO_IMAGE    = "docker.io/trinodb/trino:476"
+  MINIO_RELEASE  = "RELEASE.2025-10-15T17-29-55Z"
+  MINIO_IMAGE    = "localhost/pcl-minio:#{MINIO_RELEASE}"
+  GO_BUILDER_IMAGE = "docker.io/library/golang:1.24.8-bookworm"
+  AWS_CLI_IMAGE  = "docker.io/amazon/aws-cli:2.27.41"
+  ICEBERG_REST_IMAGE = "docker.io/apache/iceberg-rest-fixture:1.10.1"
 
-  # Iceberg warehouse. The path MUST be identical in every container that reads
-  # or writes Iceberg: HadoopCatalog addresses catalog metadata and data files
-  # by this location, so a per-service remap would break table resolution.
-  WAREHOUSE_PATH = "/warehouse"
+  MINIO_ENDPOINT = "http://minio:9000"
+  TRINO_CATALOG_TEMPLATE = File.join(ROOT, "infra", "trino", "etc", "catalog", "iceberg.properties.template")
+  TRINO_CATALOG_OUTPUT = File.join(ROOT, ".local", "trino", "catalog", "iceberg.properties")
 
   ENV_FILE = File.join(ROOT, ".env")
 
@@ -65,6 +71,21 @@ module Config
     value = load_env![key]
     abort("Missing required setting #{key} in .env") if value.nil? || value.empty?
     value
+  end
+
+  # Render local-only credentials into an ignored Trino catalog file.
+  def self.render_trino_catalog!(env = load_env!)
+    template = File.read(TRINO_CATALOG_TEMPLATE)
+    replacements = {
+      "PCL_MINIO_ROOT_USER" => env.fetch("PCL_MINIO_ROOT_USER"),
+      "PCL_MINIO_ROOT_PASSWORD" => env.fetch("PCL_MINIO_ROOT_PASSWORD"),
+      "PCL_MINIO_REGION" => env.fetch("PCL_MINIO_REGION"),
+      "PCL_ICEBERG_BUCKET" => env.fetch("PCL_ICEBERG_BUCKET")
+    }
+    replacements.each { |key, value| template = template.gsub("__#{key}__", value) }
+
+    FileUtils.mkdir_p(File.dirname(TRINO_CATALOG_OUTPUT))
+    File.open(TRINO_CATALOG_OUTPUT, "w", 0o600) { |file| file.write(template) }
   end
 end
 

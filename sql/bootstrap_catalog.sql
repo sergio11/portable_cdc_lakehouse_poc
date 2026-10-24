@@ -1,10 +1,9 @@
 -- ---------------------------------------------------------------------------
 -- Iceberg lakehouse bootstrap (SRS 6.1).
 --
--- Executed against Trino, which creates Iceberg tables through the HadoopCatalog
--- configured in infra/trino/etc/catalog/iceberg.properties. Namespaces map to
--- directories under the warehouse root, so `raw`, `silver` and `ops` are simply
--- `raw/`, `silver/` and `ops/` inside /warehouse.
+-- Executed against Trino, which creates Iceberg tables through the REST catalog
+-- configured in infra/trino/etc/catalog/iceberg.properties.template. The REST
+-- catalog and Trino both use the MinIO-backed S3 warehouse.
 --
 -- Conventions
 --   * Business payloads are modelled as MAP(VARCHAR, VARCHAR) rather than JSON.
