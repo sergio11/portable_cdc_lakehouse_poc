@@ -1,22 +1,31 @@
-# Portable CDC Lakehouse — Engineering POC
+# 🧊 Portable CDC Lakehouse 🚀
 
-A local, reproducible CDC lakehouse experiment that captures PostgreSQL changes, normalizes them with Scala on the Apache Beam Java SDK, stores append-only history in Apache Iceberg on MinIO, and materializes an auditable current-state table.
+### Open-source data engineering experiment with Apache Beam, Flink and Iceberg
 
-This open-source POC exercises the same Beam graph with DirectRunner and with the classic FlinkRunner on a separate Flink JobManager and TaskManager. It is an engineering experiment, not a production-certified data platform.
+Portable CDC Lakehouse is a local Proof of Concept (POC) for capturing database changes, processing them as a stream, and storing both change history and current state in an open table format.
 
-> **Current status:** the local stack, bounded Beam-to-Iceberg flow, Flink cluster submission, current-state materialization, and isolated replay are implemented and have runtime evidence. Some integration, portability-comparison, and recovery scenarios remain experimental; see [POC validation status](#poc-validation-status).
+It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Flink, Apache Iceberg, MinIO, and Trino. The same Beam graph has been exercised with DirectRunner and the classic FlinkRunner on separate JobManager and TaskManager containers.
 
-## What this POC demonstrates
+## ⚠️ Disclaimer
 
-- PostgreSQL logical decoding through Debezium and Kafka Connect.
-- A canonical CDC contract with validation, stable event IDs, source ordering, and dead-letter routing.
-- A portable Beam graph running with DirectRunner or the classic FlinkRunner.
-- Append-only raw history and a separate Iceberg current-state projection with versioned delete tombstones.
-- Replay into a run-specific table without overwriting the canonical projection.
-- SQL inspection and reconciliation through Trino.
-- A local stack managed by Podman, with pinned versions and manual Rake commands.
+This repository is an open-source engineering experiment intended for learning and architectural exploration. It is a POC, not a production-ready data platform. It does not provide production availability, security hardening, recovery guarantees, performance SLAs, or end-to-end exactly-once delivery.
 
-## Architecture
+## 🎯 Project goal
+
+The goal is to make the path from a relational database change to an auditable lakehouse table visible and reproducible. The POC focuses on the boundaries that are easy to get wrong in streaming systems: CDC envelope normalization, source-position ordering, duplicate delivery, delete tombstones, replay, and the interaction between Beam runners and Iceberg storage.
+
+## ✨ Key highlights
+
+- 🐘 Capture PostgreSQL changes from the WAL with Debezium.
+- 📨 Publish CDC events to Kafka and consume them with a Beam graph.
+- 🔀 Run the graph with DirectRunner or submit it to a separate Flink cluster.
+- 🧾 Keep append-only CDC history in Iceberg on MinIO.
+- 🪦 Materialize one current-state row per order, preserving deletes as versioned tombstones.
+- 🔁 Replay raw history into an isolated Iceberg table.
+- 🔎 Inspect tables, snapshots, and discrepancies with Trino.
+- 📦 Run local dependencies with Podman; operate the POC through Rake commands.
+
+## 🏗️ Architecture
 
 ```mermaid
 flowchart LR
@@ -53,7 +62,7 @@ flowchart LR
     MINIO --- REPLAY_TABLE
 ```
 
-### Runtime flow
+### 🔄 Runtime flow
 
 1. PostgreSQL writes changes to its logical WAL. Debezium reads those changes and publishes envelopes to Kafka.
 2. Beam reads the topic, ignores Kafka's null-value delete markers, normalizes Debezium envelopes, and routes valid events to raw history and invalid envelopes to the dead-letter table.
@@ -83,24 +92,49 @@ sequenceDiagram
     T->>S: Idempotent MERGE / versioned tombstone
 ```
 
-## Technology choices
+## 🧰 Technologies and why they were chosen
 
-| Technology | Role | Why it is used here |
-|---|---|---|
-| Scala 2.13 on Beam Java SDK 2.76 | Pipeline code and common transformations | Keeps the pipeline on Beam's JVM API while allowing the implementation to be written in Scala. Beam does not provide a separate official Scala SDK, so Scala/JVM serialization and runner compatibility are explicit validation concerns. |
-| DirectRunner | Local runner | Gives a low-friction path to execute the bounded fixture without a cluster. |
-| Flink 2.2.1 + classic FlinkRunner | Distributed runner | Demonstrates a JVM job submitted to a real local JobManager/TaskManager cluster using the same Beam graph. |
-| PostgreSQL 17 | Operational source | Provides a familiar relational source and logical WAL for CDC. |
-| Debezium 3.2 + Kafka Connect | CDC capture | Converts PostgreSQL WAL changes and snapshots into a standard Kafka topic. |
-| Kafka 3.9.1 (KRaft) | Durable event transport | Separates source capture from Beam consumption without adding ZooKeeper to this single-node POC. |
-| Apache Iceberg 1.11 | Raw history and table format | Provides append history, table snapshots, and a versioned current-state table on object storage. |
-| MinIO | S3-compatible object storage | Gives Beam and Trino one local object-store endpoint using the S3 API. The pinned upstream MinIO release is built locally because the upstream community image is no longer published. |
-| Iceberg REST fixture 1.10.1 + SQLite | Shared catalog metadata | Gives Beam and Trino a common REST catalog. SQLite catalog metadata persists in a Podman volume. |
-| Trino 476 | SQL materialization, inspection, and reconciliation | Runs the Iceberg `MERGE` and provides a direct way to inspect state and snapshots. It is also the reason raw-to-silver materialization stays outside the Beam graph. |
-| Podman + Podman Compose | Local services and job containers | Satisfies the container-runtime requirement without Docker Engine and keeps service versions and volumes in `compose.yaml`. |
-| Rake | Manual task interface | Encapsulates build, readiness, environment-file generation, pipeline submission, replay, and cleanup behind repeatable commands. Rake tasks are orchestration commands, not extra runtime services. |
+### 🐘 PostgreSQL — operational source
 
-### Pinned versions and validation
+PostgreSQL represents the application database whose changes need to reach the lakehouse. Its logical WAL gives Debezium a change stream to capture, while the sample `orders` table keeps the POC grounded in normal relational data. The current implementation focuses on one PostgreSQL source and the `orders` entity.
+
+### 🔌 Debezium and Kafka Connect — CDC capture
+
+Debezium reads the PostgreSQL WAL and emits structured change envelopes, including an initial snapshot and subsequent creates, updates, and deletes. This avoids implementing a custom database poller and gives the pipeline source metadata it can use for ordering. Kafka Connect hosts and manages the connector.
+
+### 📨 Apache Kafka — decoupled event transport
+
+Kafka buffers the CDC stream between the source connector and Beam. This lets capture and processing run independently and gives consumers a replayable topic. The local broker uses KRaft, so the single-node POC does not need ZooKeeper. This setup demonstrates the integration path; it is not a highly available Kafka deployment.
+
+### 🧠 Scala and Apache Beam — shared processing graph
+
+The pipeline is written in Scala 2.13 using Beam's Java SDK. Beam provides one graph for reading Kafka, normalizing and validating events, routing invalid input, and writing Iceberg rows. Keeping those transforms in a Beam graph makes runner portability demonstrable. Beam does not publish a separate official Scala SDK, so Scala/JVM serialization and classloading are explicit compatibility concerns in this POC.
+
+### 🏃 DirectRunner and FlinkRunner — local and distributed execution
+
+DirectRunner is useful for a quick local bounded run and functional checks. The classic FlinkRunner submits the same JVM graph to the local Flink JobManager; Flink schedules and executes the operators in the TaskManager. This makes the distributed runtime visible in Podman while keeping the business transforms shared. A separate Beam worker service is not required for this classic JVM runner. Both modes have completed bounded runs, though an isolated result-by-result equivalence comparison is still open.
+
+### 🧊 Apache Iceberg — open table format
+
+Iceberg stores both the append-only event history and the current-state projection. The raw table preserves the sequence of accepted changes for inspection and replay. The silver table holds one row per order and records deletes as versioned tombstones so older changes cannot silently restore a deleted order. Iceberg snapshots make committed table changes inspectable.
+
+### 🪣 MinIO — local S3-compatible object storage
+
+MinIO gives Beam and Trino a shared S3 API endpoint without requiring a cloud account. Iceberg data files live in its persistent Podman volume. The POC builds a pinned upstream MinIO release locally because the upstream community container image is no longer published; this is documented as an implementation constraint.
+
+### 📚 Iceberg REST catalog with SQLite — shared table metadata
+
+Beam and Trino need to resolve the same Iceberg tables and snapshots. The REST catalog fixture provides that shared catalog endpoint, and its SQLite database is persisted in a Podman volume. SQLite and the fixture image keep the local demo self-contained; this catalog setup is not intended as a production metadata service.
+
+### 🔎 Trino — SQL materialization and inspection
+
+Trino queries Iceberg tables and runs the `MERGE` that materializes the latest source-positioned event per order. Keeping current-state materialization in a separate SQL step isolates it from runner-specific streaming behavior and provides a simple way to inspect the resulting state, snapshots, and discrepancies.
+
+### 📦 Podman, Compose, and Rake — reproducible local operations
+
+Podman runs the services and job containers without requiring Docker Engine. Compose describes the pinned services, named data volumes, and optional Flink cluster. Rake provides repeatable commands for startup/readiness, builds, pipeline submission, replay, queries, and shutdown. These tasks orchestrate the workflow; they are not additional runtime services.
+
+### 📌 Pinned versions and validation
 
 | Component | Version | Validation |
 |---|---|---|
@@ -118,7 +152,7 @@ sequenceDiagram
 
 The FlinkRunner artifact family matches Flink 2.2.x, and [Beam's compatibility table](https://beam.apache.org/documentation/runners/flink/) lists support for Beam 2.75.0 and later with that runner family. The compatibility evidence above is specific to this local pinned stack; it does not claim production-cluster validation.
 
-## Data model and semantics
+## 🗂️ Data model and semantics
 
 | Table | Purpose | Important behavior |
 |---|---|---|
@@ -129,7 +163,7 @@ The FlinkRunner artifact family matches Flink 2.2.x, and [Beam's compatibility t
 
 Ordering uses LSN and transaction/sequence tie-breakers where available. Event time and arrival time are not used as the sole precedence rule. Snapshot rows are marked distinctly; deterministic event IDs include the primary key because PostgreSQL snapshot rows can share a source position.
 
-## Quick start
+## 🚀 Quick start
 
 The commands below are for Windows PowerShell from the repository root. This README contains setup, replay, and operational instructions.
 
@@ -188,7 +222,7 @@ bundle exec rake infra:down
 
 Use `bundle exec rake -T` to list the operational tasks. Build and local checks are available through `bundle exec rake verify`; CI/CD is intentionally out of scope.
 
-## Observability and evidence
+## 📊 Observability and evidence
 
 - Beam emits a JSON startup record with `run_id`, source, topic, and status, then reports available Beam counters such as accepted events, rejected events, Kafka tombstones, and Iceberg writer/snapshot counts.
 - `rake lakehouse:describe` lists tables and current-state Iceberg snapshots.
@@ -197,7 +231,7 @@ Use `bundle exec rake -T` to list the operational tasks. Build and local checks 
 - A bounded classic FlinkRunner job completed in the separate Podman cluster. The recorded run read 15 Kafka records, accepted 13 CDC events, observed 2 tombstones, and wrote one Iceberg snapshot.
 - `rake verify` passed with 54 unit and architecture tests. It does not replace the outstanding integration and recovery scenarios listed below.
 
-## POC validation status
+## 🧪 POC validation status
 
 The POC demonstrates the main CDC-to-lakehouse path, but it is **not a complete production validation**. The current evidence and remaining experimental work are summarized here.
 
@@ -213,7 +247,7 @@ The POC demonstrates the main CDC-to-lakehouse path, but it is **not a complete 
 | Iceberg and Podman operations | Demonstrated | Trino inspects tables and snapshots; Rake commands cover start/status/logs/stop/reset. |
 | Observability and performance | Partial | Available counters and SQL reports cover part of the pipeline. Complete duplicate/obsolete/commit counters and record a synthetic throughput/duration measurement. |
 
-### Remaining experimental work
+### 🔭 Remaining experimental work
 
 1. Add deterministic duplicate and out-of-order fixture scenarios; prove snapshot-versus-WAL precedence on an isolated dataset.
 2. Add an integration check that injects an invalid Debezium envelope and asserts its reason and payload in `ops.cdc_dead_letter`.
@@ -225,7 +259,7 @@ The POC demonstrates the main CDC-to-lakehouse path, but it is **not a complete 
 
 CI/CD, production cloud deployment, HA, Kubernetes, and a production SLA are outside this experiment's scope.
 
-## Strengths and trade-offs
+## ⚖️ Strengths and trade-offs
 
 | Strength | Trade-off / boundary |
 |---|---|
@@ -235,7 +269,7 @@ CI/CD, production cloud deployment, HA, Kubernetes, and a production SLA are out
 | Source positions and delete tombstones protect state ordering. | Recovery/checkpoint semantics and exactly-once behavior across Kafka, Beam, and Iceberg are not claimed. |
 | Rake offers repeatable manual operations without CI/CD. | Local resource usage and throughput have not been benchmarked as production characteristics. |
 
-## Repository map
+## 🗺️ Repository map
 
 ```text
 compose.yaml                         Podman services and the optional Flink profile
@@ -249,6 +283,6 @@ infra/fixtures/                      Deterministic PostgreSQL CDC mutations
 rakelib/                             Build, infrastructure, pipeline, replay, and query tasks
 ```
 
-## License
+## 📜 License
 
 See [LICENSE](LICENSE).
