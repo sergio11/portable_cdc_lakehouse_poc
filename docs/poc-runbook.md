@@ -56,6 +56,18 @@ For continuous consumption, leave `PCL_MAX_RECORDS=0` in `.env` and run
 `bundle exec rake pipeline:direct`. Stop it with Ctrl+C after the desired capture
 window.
 
+To run the same bounded graph through the classic FlinkRunner in embedded local
+mode, set the same record limit and use:
+
+```powershell
+$env:PCL_MAX_RECORDS = '20'
+bundle exec rake pipeline:flink
+Remove-Item Env:PCL_MAX_RECORDS
+```
+
+The Beam runner prints per-run accepted, rejected and Kafka tombstone counters
+when the runner reports metric values.
+
 ## 5. Materialize and reconcile current state
 
 ```powershell

@@ -35,8 +35,8 @@ suites in the pinned image.
 |---|---|---|
 | Apache Beam SDK | 2.76.0 | Verified |
 | Beam DirectRunner | 2.76.0 | Verified (bounded Kafka-to-Iceberg run) |
-| Beam FlinkRunner | 2.76.0 (`beam-runners-flink-2.2`) | Verified (classpath resolves); runtime pending |
-| Apache Flink | 2.2.x | Pending |
+| Beam FlinkRunner | 2.76.0 (`beam-runners-flink-2.2`) | Verified (bounded classic FlinkRunner embedded run) |
+| Apache Flink | 2.2.x | Verified (embedded local runtime; cluster deployment pending) |
 | KafkaIO | 2.76.0 | Verified (classpath resolves) |
 | IcebergIO | 2.76.0 | Verified (classpath resolves) |
 | Apache Iceberg | 1.11.0 | Verified (Beam IcebergIO write to MinIO) |
@@ -90,13 +90,20 @@ catalog and MinIO warehouse; Trino read the resulting snapshot. The warehouse is
 Kafka advertises only `kafka:9092` and is not published to the host. The Beam
 application joins the `pcl_default` Compose network and uses this same address.
 
-## 4. Known Flink dependency risk
+## 4. Flink portability scope
 
-Beam's FlinkRunner may encounter an `lz4-java` capability conflict between
-Flink's `at.yawk.lz4:lz4-java` and Kafka's `org.lz4:lz4-java`. The portability
-phase must confirm whether sbt's classpath is affected and record the outcome.
+`rake pipeline:flink` submits the same bounded graph to Beam's classic
+FlinkRunner in embedded local mode. It is useful for POC portability checks and
+does not require a separate Flink cluster. Cluster deployment, checkpoint
+recovery and long-running job operations remain outside this local validation.
 
-## 5. Environment notes
+## 5. Known Flink dependency risk
+
+The bounded embedded run did not encounter the `lz4-java` capability conflict
+between Flink's `at.yawk.lz4:lz4-java` and Kafka's `org.lz4:lz4-java`. A remote
+cluster run has not been exercised.
+
+## 6. Environment notes
 
 - sbt build outputs and Coursier caches use Podman named volumes to avoid slow
   or incompatible Windows/WSL bind-mounted timestamp updates.

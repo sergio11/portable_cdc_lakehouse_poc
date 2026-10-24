@@ -32,10 +32,10 @@ import scala.jdk.CollectionConverters._
   */
 object CdcStreamingPipeline {
 
-  private val RawTag        = new TupleTag[Row]() {}
-  private val DeadLetterTag = new TupleTag[Row]() {}
-  private val AcceptedEvents = Metrics.counter("pcl.cdc", "accepted_events")
-  private val RejectedEvents = Metrics.counter("pcl.cdc", "rejected_events")
+  private val RawTag          = new TupleTag[Row]() {}
+  private val DeadLetterTag   = new TupleTag[Row]() {}
+  private val AcceptedEvents  = Metrics.counter("pcl.cdc", "accepted_events")
+  private val RejectedEvents  = Metrics.counter("pcl.cdc", "rejected_events")
   private val KafkaTombstones = Metrics.counter("pcl.cdc", "kafka_tombstones")
 
   private val ImageType = Schema.FieldType
@@ -99,11 +99,12 @@ object CdcStreamingPipeline {
         val result = pipeline.run()
         result.waitUntilFinish()
         try {
-          val counters = result.metrics().queryMetrics(MetricsFilter.builder().build()).getCounters.asScala
+          val counters =
+            result.metrics().queryMetrics(MetricsFilter.builder().build()).getCounters.asScala
           counters.foreach { counter =>
             val name = counter.getKey.metricName()
             println(
-              s"""{"component":"CdcStreamingPipeline","run_id":"${settings.runId}","metric":"${name.getName}","namespace":"${name.getNamespace}","value":${counter.getCommitted.getValue}}"""
+              s"""{"component":"CdcStreamingPipeline","run_id":"${settings.runId}","metric":"${name.getName}","namespace":"${name.getNamespace}","value":${counter.getAttempted}}"""
             )
           }
         } catch {
