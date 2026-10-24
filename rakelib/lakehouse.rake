@@ -102,6 +102,15 @@ namespace :lakehouse do
       end
     end
   end
+
+  desc "Materialize the latest raw CDC event per key into silver.orders_current"
+  task :materialize do
+    env = Config.load_env!
+    Infra.ensure_iceberg_bucket!(env)
+    path = File.join(Config::ROOT, "sql", "materialize_orders.sql")
+    result = Trino.execute_file(path, env)
+    puts "Current-state projection refreshed (query #{result['query_id']})."
+  end
 end
 
 namespace :debezium do

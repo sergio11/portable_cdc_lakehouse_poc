@@ -74,7 +74,9 @@ SELECT expected.primary_key                AS order_key,
        END                                 AS discrepancy
   FROM expected
   LEFT JOIN projection
-    ON projection.order_id = CAST(expected.primary_key AS BIGINT)
+    ON projection.order_id = CAST(
+      regexp_extract(expected.primary_key, 'order_id=([^#]+)', 1) AS BIGINT
+    )
  ORDER BY discrepancy, order_key;
 
 -- ---------------------------------------------------------------------------
