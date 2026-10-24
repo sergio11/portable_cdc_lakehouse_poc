@@ -14,6 +14,10 @@ val Versions = new
   val flinkRun   = "2.2"     // Flink runner artifact family (Flink 2.2.x, Beam >= 2.75)
   val iceberg    = "1.11.0"  // kept in sync with the Beam 2.76 Iceberg dependency
   val scalaTest  = "3.2.19"
+
+  // Wire-format parsing for the Debezium envelope lives in the adapter layer,
+  // never in the domain, so the core stays dependency-free.
+  val circe = "0.14.10"
 }
 
 ThisBuild / organization := "com.example"
@@ -32,6 +36,8 @@ libraryDependencies ++= Seq(
   "org.apache.beam" % s"beam-runners-flink-${Versions.flinkRun}" % Versions.beam,
   "org.apache.beam" % "beam-sdks-java-io-kafka"      % Versions.beam,
   "org.apache.beam" % "beam-sdks-java-io-iceberg"    % Versions.beam,
+  "io.circe" %% "circe-core"                        % Versions.circe,
+  "io.circe" %% "circe-parser"                      % Versions.circe,
   "org.scalatest"  %% "scalatest"                    % Versions.scalaTest % Test
 )
 

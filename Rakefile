@@ -1,5 +1,12 @@
 # frozen_string_literal: true
 
+# Unbuffered output. When Rake's stdout is a pipe (CI logs, a terminal capture,
+# or a tool reading our stream) Ruby block-buffers it, so progress lines would
+# only appear once the process exited. For long sbt invocations that reads as a
+# hang. Flushing on every write makes progress visible immediately.
+$stdout.sync = true
+$stderr.sync = true
+
 # Portable CDC Lakehouse — operational entrypoint.
 #
 # Every build, test and (later) infra task is a Rake task. There are no POSIX

@@ -78,6 +78,7 @@ module Build
   UNIT_TEST_PATTERNS = %w[
     com.example.pcl.architecture.*
     com.example.pcl.domain.*
+    com.example.pcl.adapters.*
   ].freeze
 
   # sbt commands are passed as separate argv entries (never interpolated into a
