@@ -40,7 +40,14 @@ namespace :pipeline do
   task :flink do
     run_pipeline([
       "--runner=org.apache.beam.runners.flink.FlinkRunner",
-      "--flinkMaster=flink-jobmanager:8081"
+      "--flinkMaster=flink-jobmanager:8081",
+      # Checkpointing is what makes the streaming job restartable. Without it
+      # Flink keeps no durable state and a restart replays from the committed
+      # Kafka offsets, appending duplicate rows to the audit table.
+      "--checkpointingInterval=10000",
+      "--checkpointingMode=EXACTLY_ONCE",
+      "--externalizedCheckpointsEnabled=true",
+      "--retainExternalizedCheckpointsOnCancellation=true"
     ], flink_cluster: true)
   end
 

@@ -104,23 +104,90 @@ services:
       - "127.0.0.1:${PCL_MINIO_API_PORT}:9000"
       - "127.0.0.1:${PCL_MINIO_CONSOLE_PORT}:9001"
 
-  iceberg-catalog:
-    image: docker.io/apache/iceberg-rest-fixture:1.10.1
-    container_name: pcl-iceberg-catalog
+  # One-shot metastore bootstrap. Since Polaris 1.8.0 the server no longer
+  # creates its own tables, so the admin tool must run `bootstrap` first. It is
+  # idempotent: an already-bootstrapped realm is reported and skipped, which
+  # keeps `rake infra:up` re-runnable.
+  polaris-bootstrap:
+    image: docker.io/apache/polaris-admin-tool:${PCL_POLARIS_VERSION}
+    container_name: pcl-polaris-bootstrap
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_DATABASE_TYPE: postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/polaris
+      QUARKUS_DATASOURCE_USERNAME: ${PCL_POSTGRES_USER}
+      QUARKUS_DATASOURCE_PASSWORD: ${PCL_POSTGRES_PASSWORD}
+      QUARKUS_OTEL_SDK_DISABLED: "true"
+    command:
+      - bootstrap
+      - -r
+      - POLARIS
+      - -c
+      - POLARIS,${PCL_POLARIS_CLIENT_ID},${PCL_POLARIS_CLIENT_SECRET}
+    restart: "no"
+
+  # Apache Polaris is the Iceberg REST catalog. Its metastore is the same
+  # PostgreSQL instance (database `polaris`, schema `polaris_schema`), so the
+  # catalog survives container restarts without SQLite or a local file.
+  # `stsUnavailable=true` on the catalog disables credential vending: MinIO does
+  # not implement STS, and Beam/Trino already hold their own S3 credentials.
+  polaris:
+    image: docker.io/apache/polaris:${PCL_POLARIS_VERSION}
+    container_name: pcl-polaris
+    depends_on:
+      postgres:
+        condition: service_healthy
+      polaris-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_DATABASE_TYPE: postgresql
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_RETRIES: "5"
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_INITIAL_DELAY_IN_MS: "100"
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_DURATION_IN_MS: "5000"
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/polaris
+      QUARKUS_DATASOURCE_USERNAME: ${PCL_POSTGRES_USER}
+      QUARKUS_DATASOURCE_PASSWORD: ${PCL_POSTGRES_PASSWORD}
+      POLARIS_REALM_CONTEXT_REALMS: POLARIS
+      QUARKUS_OTEL_SDK_DISABLED: "true"
+      # Only S3 is allowed. `ALLOW_INSECURE_STORAGE_TYPES` is deliberately NOT
+      # set: it exists for FILE storage, and Polaris treats it as a severe
+      # readiness issue. MinIO needs no STS, which `stsUnavailable` covers.
+      polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": '["S3"]'
+      # Polaris needs these to reach MinIO when it inspects or creates metadata.
       AWS_ACCESS_KEY_ID: ${PCL_MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${PCL_MINIO_ROOT_PASSWORD}
       AWS_REGION: ${PCL_MINIO_REGION}
-      CATALOG_CATALOG_NAME: pcl
-      CATALOG_URI: jdbc:sqlite:/catalog/iceberg_catalog.db?journal_mode=WAL
-      CATALOG_WAREHOUSE: s3://${PCL_ICEBERG_BUCKET}/warehouse/
-      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://minio:9000
-      CATALOG_S3_PATH__STYLE__ACCESS: "true"
-    volumes:
-      - iceberg_catalog_data:/catalog:U
     ports:
       - "127.0.0.1:${PCL_ICEBERG_CATALOG_PORT}:8181"
+      - "127.0.0.1:${PCL_POLARIS_HEALTH_PORT:-8182}:8182"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  # One-shot catalog bootstrap. Idempotent: it checks for the catalog first and
+  # only creates it when missing, so `rake infra:up` can be re-run safely.
+  polaris-setup:
+    image: docker.io/alpine/curl:8.22.0
+    container_name: pcl-polaris-setup
+    depends_on:
+      polaris:
+        condition: service_healthy
+    environment:
+      PCL_POLARIS_CLIENT_ID: ${PCL_POLARIS_CLIENT_ID}
+      PCL_POLARIS_CLIENT_SECRET: ${PCL_POLARIS_CLIENT_SECRET}
+      PCL_ICEBERG_BUCKET: ${PCL_ICEBERG_BUCKET}
+      PCL_MINIO_REGION: ${PCL_MINIO_REGION}
+    volumes:
+      - ./infra/polaris:/polaris:ro
+    entrypoint: ["/bin/sh", "/polaris/create-catalog.sh"]
+    restart: "no"
 
   connect:
     image: quay.io/debezium/connect:3.2.4.Final
@@ -146,6 +213,11 @@ services:
   trino:
     image: docker.io/trinodb/trino:476
     container_name: pcl-trino
+    depends_on:
+      # Trino loads the Iceberg catalog at startup; the `pcl` catalog must exist
+      # in Polaris by then, otherwise the connector fails and stays broken.
+      polaris-setup:
+        condition: service_completed_successfully
     volumes:
       # Generated from the local .env; contains credentials and is gitignored.
       - ./.local/trino/catalog:/etc/trino/catalog:ro
@@ -172,7 +244,13 @@ services:
         rest.address: flink-jobmanager
         rest.bind-address: 0.0.0.0
         parallelism.default: 1
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.backend.type: rocksdb
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.mode: EXACTLY_ONCE
         classloader.parent-first-patterns.default: "java.";"org.apache.flink.";"com.esotericsoftware.kryo";"org.apache.hadoop.";"javax.annotation.";"org.xml";"javax.xml";"org.apache.xerces";"org.w3c";"org.rocksdb.";"org.slf4j";"org.apache.log4j";"org.apache.logging";"org.apache.commons.logging";"ch.qos.logback"
+    volumes:
+      - flink_checkpoints:/opt/flink/checkpoints
     ports:
       - "127.0.0.1:${PCL_FLINK_WEB_PORT:-8081}:8081"
     profiles: ["flink"]
@@ -193,12 +271,16 @@ services:
         taskmanager.memory.managed.fraction: 0.2
         taskmanager.numberOfTaskSlots: 1
         parallelism.default: 1
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.backend.type: rocksdb
         classloader.parent-first-patterns.default: "java.";"org.apache.flink.";"com.esotericsoftware.kryo";"org.apache.hadoop.";"javax.annotation.";"org.xml";"javax.xml";"org.apache.xerces";"org.w3c";"org.rocksdb.";"org.slf4j";"org.apache.log4j";"org.apache.logging";"org.apache.commons.logging";"ch.qos.logback"
+    volumes:
+      - flink_checkpoints:/opt/flink/checkpoints
     profiles: ["flink"]
 
 volumes:
   postgres_data:
   kafka_data:
   minio_data:
-  iceberg_catalog_data:
   trino_data:
+  flink_checkpoints:

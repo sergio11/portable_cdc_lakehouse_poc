@@ -33,7 +33,8 @@ module Config
   MINIO_IMAGE    = "localhost/pcl-minio:#{MINIO_RELEASE}"
   GO_BUILDER_IMAGE = "docker.io/library/golang:1.24.8-bookworm"
   AWS_CLI_IMAGE  = "docker.io/amazon/aws-cli:2.27.41"
-  ICEBERG_REST_IMAGE = "docker.io/apache/iceberg-rest-fixture:1.10.1"
+  POLARIS_VERSION = "1.8.0"
+  POLARIS_IMAGE  = "docker.io/apache/polaris:#{POLARIS_VERSION}"
 
   MINIO_ENDPOINT = "http://minio:9000"
   TRINO_CATALOG_TEMPLATE = File.join(ROOT, "infra", "trino", "etc", "catalog", "iceberg.properties.template")
@@ -82,7 +83,10 @@ module Config
       "PCL_MINIO_ROOT_USER" => env.fetch("PCL_MINIO_ROOT_USER"),
       "PCL_MINIO_ROOT_PASSWORD" => env.fetch("PCL_MINIO_ROOT_PASSWORD"),
       "PCL_MINIO_REGION" => env.fetch("PCL_MINIO_REGION"),
-      "PCL_ICEBERG_BUCKET" => env.fetch("PCL_ICEBERG_BUCKET")
+      "PCL_ICEBERG_BUCKET" => env.fetch("PCL_ICEBERG_BUCKET"),
+      "PCL_ICEBERG_WAREHOUSE" => env.fetch("PCL_ICEBERG_WAREHOUSE", "pcl"),
+      "PCL_POLARIS_CLIENT_ID" => env.fetch("PCL_POLARIS_CLIENT_ID", "root"),
+      "PCL_POLARIS_CLIENT_SECRET" => env.fetch("PCL_POLARIS_CLIENT_SECRET")
     }
     replacements.each { |key, value| template = template.gsub("__#{key}__", value) }
 
@@ -98,15 +102,15 @@ module Config
       "PCL_SOURCE_ID" => env.fetch("PCL_SOURCE_ID"),
       "PCL_KAFKA_BOOTSTRAP_SERVERS" => env.fetch("PCL_KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
       "PCL_CDC_TOPIC" => env.fetch("PCL_CDC_TOPIC", "pcl.public.orders"),
-      "PCL_ICEBERG_CATALOG_URI" => env.fetch("PCL_ICEBERG_CATALOG_URI", "http://iceberg-catalog:8181"),
-      "PCL_ICEBERG_WAREHOUSE" => env.fetch(
-        "PCL_ICEBERG_WAREHOUSE",
-        "s3://#{env.fetch('PCL_ICEBERG_BUCKET')}/warehouse/"
-      ),
+      "PCL_ICEBERG_CATALOG_URI" => env.fetch("PCL_ICEBERG_CATALOG_URI", "http://polaris:8181/api/catalog"),
+      "PCL_ICEBERG_WAREHOUSE" => env.fetch("PCL_ICEBERG_WAREHOUSE", "pcl"),
+      "PCL_POLARIS_CLIENT_ID" => env.fetch("PCL_POLARIS_CLIENT_ID", "root"),
+      "PCL_POLARIS_CLIENT_SECRET" => env.fetch("PCL_POLARIS_CLIENT_SECRET"),
       "PCL_MINIO_ENDPOINT" => env.fetch("PCL_MINIO_ENDPOINT", "http://minio:9000"),
       "PCL_MINIO_REGION" => env.fetch("PCL_MINIO_REGION"),
       "PCL_MINIO_ROOT_USER" => env.fetch("PCL_MINIO_ROOT_USER"),
       "PCL_MINIO_ROOT_PASSWORD" => env.fetch("PCL_MINIO_ROOT_PASSWORD"),
+      "PCL_PRIMARY_KEY_COLUMNS" => env.fetch("PCL_PRIMARY_KEY_COLUMNS", "order_id"),
       "PCL_WRITE_FREQUENCY_SECONDS" => env.fetch("PCL_WRITE_FREQUENCY_SECONDS", "10"),
       "PCL_MAX_RECORDS" => env.fetch("PCL_MAX_RECORDS", "0")
     }

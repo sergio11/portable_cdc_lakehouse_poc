@@ -1,10 +1,18 @@
-# Trino <-> Iceberg REST Catalog <-> MinIO wiring. Rake renders the local
-# credentials into an ignored file under .local/ before starting the stack.
+# Trino <-> Apache Polaris (Iceberg REST) <-> MinIO wiring.
+# Rake renders the local credentials into an ignored file under .local/ before
+# starting the stack. Polaris uses OAuth2 client-credentials; MinIO does not
+# implement STS, so credential vending is disabled and Trino keeps its own S3
+# credentials for data-file access.
 connector.name=iceberg
 
 iceberg.catalog.type=rest
-iceberg.rest-catalog.uri=http://iceberg-catalog:8181
-iceberg.rest-catalog.warehouse=s3://__PCL_ICEBERG_BUCKET__/warehouse/
+iceberg.rest-catalog.uri=http://polaris:8181/api/catalog
+iceberg.rest-catalog.warehouse=__PCL_ICEBERG_WAREHOUSE__
+iceberg.rest-catalog.security=OAUTH2
+iceberg.rest-catalog.oauth2.credential=__PCL_POLARIS_CLIENT_ID__:__PCL_POLARIS_CLIENT_SECRET__
+iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
+iceberg.rest-catalog.oauth2.server-uri=http://polaris:8181/api/catalog/v1/oauth/tokens
+iceberg.rest-catalog.vended-credentials-enabled=false
 
 fs.native-s3.enabled=true
 s3.endpoint=http://minio:9000

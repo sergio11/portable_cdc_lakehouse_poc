@@ -107,6 +107,88 @@ module Infra
     false
   end
 
+  # --- Polaris ---------------------------------------------------------------
+  #
+  # Polaris exposes the catalog API on 8181 and a Quarkus management/health API
+  # on 8182. The catalog itself is created by the one-shot `polaris-setup`
+  # container, so readiness is not just "the process is up": we authenticate and
+  # confirm the `pcl` catalog exists before any Iceberg client connects.
+
+  def polaris_token(env = Config.load_env!)
+    port = env.fetch("PCL_ICEBERG_CATALOG_PORT")
+    uri = URI("http://localhost:#{port}/api/catalog/v1/oauth/tokens")
+    request = Net::HTTP::Post.new(uri)
+    request.basic_auth(env.fetch("PCL_POLARIS_CLIENT_ID"), env.fetch("PCL_POLARIS_CLIENT_SECRET"))
+    request["Polaris-Realm"] = "POLARIS"
+    request.set_form_data("grant_type" => "client_credentials", "scope" => "PRINCIPAL_ROLE:ALL")
+
+    response = Net::HTTP.start(uri.hostname, uri.port, read_timeout: 10) do |http|
+      http.request(request)
+    end
+    return nil unless response.is_a?(Net::HTTPSuccess)
+
+    JSON.parse(response.body)["access_token"]
+  rescue StandardError
+    nil
+  end
+
+  # Create the Polaris database/schema when upgrading an existing Postgres
+  # volume. The init script only runs on a brand-new volume, and Polaris refuses
+  # to start if its schema is missing.
+  def ensure_polaris_database!(env = Config.load_env!)
+    password = env.fetch("PCL_POSTGRES_PASSWORD")
+    user = env.fetch("PCL_POSTGRES_USER")
+    database = env.fetch("PCL_POSTGRES_DB")
+
+    exists = capture(
+      Config::POSTGRES_IMAGE,
+      "psql", "-h", "postgres", "-U", user, "-d", database, "-tAc",
+      "SELECT 1 FROM pg_database WHERE datname = 'polaris'",
+      environment: { "PGPASSWORD" => password }
+    ).strip == "1"
+
+    unless exists
+      run!(
+        "podman", "run", "--rm", "--network", "pcl_default",
+        "-e", "PGPASSWORD",
+        Config::POSTGRES_IMAGE,
+        "psql", "-v", "ON_ERROR_STOP=1",
+        "-h", "postgres", "-U", user, "-d", database,
+        "-c", "CREATE DATABASE polaris",
+        environment: { "PGPASSWORD" => password }
+      )
+      puts "Created Postgres database 'polaris' for Apache Polaris."
+    end
+
+    run!(
+      "podman", "run", "--rm", "--network", "pcl_default",
+      "-e", "PGPASSWORD",
+      Config::POSTGRES_IMAGE,
+      "psql", "-v", "ON_ERROR_STOP=1",
+      "-h", "postgres", "-U", user, "-d", "polaris",
+      "-c", "CREATE SCHEMA IF NOT EXISTS polaris_schema",
+      environment: { "PGPASSWORD" => password }
+    )
+  end
+
+  def polaris_catalog_ready?(env = Config.load_env!)
+    token = polaris_token(env)
+    return false if token.nil? || token.empty?
+
+    port = env.fetch("PCL_ICEBERG_CATALOG_PORT")
+    uri = URI("http://localhost:#{port}/api/management/v1/catalogs/pcl")
+    request = Net::HTTP::Get.new(uri)
+    request["Authorization"] = "Bearer #{token}"
+    request["Polaris-Realm"] = "POLARIS"
+
+    response = Net::HTTP.start(uri.hostname, uri.port, read_timeout: 10) do |http|
+      http.request(request)
+    end
+    response.is_a?(Net::HTTPSuccess)
+  rescue StandardError
+    false
+  end
+
   # Ensure the S3 bucket exists before Iceberg creates its first table. The
   # pinned AWS CLI image receives secrets through the process environment.
   def ensure_iceberg_bucket!(env = Config.load_env!)
@@ -207,6 +289,36 @@ module Trino
     { "query_id" => query_id, "data" => results }
   end
 
+  # Human-readable label for a statement: the numbered section heading of its
+  # leading comment block when there is one, otherwise its first descriptive
+  # line. Separator lines (`-- ----`) are ignored. Preferring the numbered
+  # heading keeps `reconciliation.sql` labels stable even though the first
+  # statement also carries the file-level header comment.
+  def statement_label(statement)
+    lines = statement.lines.map(&:strip)
+    first_code = lines.index { |line| !line.empty? && !line.start_with?("--") } || lines.length
+    candidates = []
+
+    # Walk up from the first SQL line so the label comes from the comment block
+    # that immediately precedes the statement, not from a file-level header
+    # separated from it by a blank line.
+    (first_code - 1).downto(0) do |index|
+      line = lines[index]
+      next if line.empty?
+      break unless line.start_with?("--")
+
+      candidate = line.sub(/\A--\s*/, "").strip
+      next if candidate.empty? || candidate.match?(/\A-+\z/)
+
+      candidates.unshift(candidate)
+    end
+
+    numbered = candidates.reverse.find { |candidate| candidate.match?(/\A\d+\.\s/) }
+    return numbered if numbered
+
+    candidates.first || lines.reject(&:empty?).first.to_s[0, 80]
+  end
+
   # Split SQL files without treating semicolons in comments or quoted strings
   # as statement terminators. Trino's statement endpoint accepts one statement
   # per request, while our bootstrap and reconciliation files contain several.
@@ -275,21 +387,31 @@ namespace :infra do
   task :up do
     env = Config.load_env!
     Config.render_trino_catalog!(env)
+
+    # Two-phase start: Postgres first, because Polaris needs its database and
+    # schema to exist before it can connect. The init scripts only run on a
+    # brand-new volume, so this also upgrades an existing volume in place.
+    Infra.compose("up", "--build", "-d", "postgres")
+    Infra.wait_until!("Postgres") { Infra.postgres_ready? }
+    Infra.ensure_polaris_database!(env)
     Infra.compose("up", "--build", "-d")
 
     Infra.wait_until!("Kafka broker")       { Infra.kafka_ready? }
-    Infra.wait_until!("Postgres")           { Infra.postgres_ready? }
     Infra.wait_until!("Kafka Connect REST") { Infra.http_ok?("http://localhost:#{env.fetch('PCL_CONNECT_PORT')}/connectors") }
     Infra.wait_until!("MinIO S3 API")       { Infra.http_ok?("http://localhost:#{env.fetch('PCL_MINIO_API_PORT')}/minio/health/ready") }
     Infra.ensure_iceberg_bucket!(env)
-    Infra.wait_until!("Iceberg REST Catalog") { Infra.http_ok?("http://localhost:#{env.fetch('PCL_ICEBERG_CATALOG_PORT')}/v1/config") }
+    Infra.wait_until!("Apache Polaris health") do
+      Infra.http_ok?("http://localhost:#{env.fetch('PCL_POLARIS_HEALTH_PORT', '8182')}/q/health")
+    end
+    Infra.wait_until!("Polaris catalog 'pcl' (polaris-setup)") { Infra.polaris_catalog_ready?(env) }
     Infra.wait_until!("Trino REST")         { Infra.http_ok?("http://localhost:#{env.fetch('PCL_TRINO_PORT')}/v1/info") }
 
     puts "\nAll services ready."
     puts "  Trino    http://localhost:#{env.fetch('PCL_TRINO_PORT')}"
     puts "  Connect  http://localhost:#{env.fetch('PCL_CONNECT_PORT')}"
     puts "  MinIO    http://localhost:#{env.fetch('PCL_MINIO_CONSOLE_PORT')}"
-    puts "  Catalog  http://localhost:#{env.fetch('PCL_ICEBERG_CATALOG_PORT')}"
+    puts "  Polaris  http://localhost:#{env.fetch('PCL_ICEBERG_CATALOG_PORT')}/api/catalog"
+    puts "  Polaris health  http://localhost:#{env.fetch('PCL_POLARIS_HEALTH_PORT', '8182')}/q/health"
   end
 
   desc "Stop the stack, keeping volumes (the CDC history is preserved)"
