@@ -130,7 +130,17 @@ namespace :lakehouse do
 
     target = "iceberg.silver.orders_current_replay_#{replay_id}"
     Infra.ensure_iceberg_bucket!(env)
-    Trino.execute("CREATE TABLE IF NOT EXISTS #{target} WITH (format_version = 2) AS SELECT * FROM iceberg.silver.orders_current WHERE false", env)
+
+    # Replay must be a clean rebuild: re-running the same id must not inherit
+    # rows from a previous, possibly different, window. The source schema is
+    # taken from the live projection, so `lakehouse:init` must have run.
+    Trino.execute_file(File.join(Config::ROOT, "sql", "bootstrap_catalog.sql"), env)
+    Trino.execute("DROP TABLE IF EXISTS #{target}", env)
+    Trino.execute(
+      "CREATE TABLE #{target} WITH (format_version = 2) " \
+      "AS SELECT * FROM iceberg.silver.orders_current WHERE false",
+      env
+    )
 
     filter = [
       from_lsn && "lsn >= #{from_lsn}",
@@ -142,6 +152,32 @@ namespace :lakehouse do
     result = Trino.execute(sql.sub(/;\s*\z/, ""), env)
     summary = Trino.execute("SELECT count(*), count_if(is_deleted) FROM #{target}", env)["data"].flatten
     puts "Replay #{replay_id} materialized to #{target}: #{summary[0]} keys, #{summary[1]} tombstones (query #{result['query_id']})."
+
+    # A full replay (no window) must reproduce the live projection exactly on
+    # the business columns and the source position. A bounded replay is a
+    # partial history by construction, so only report its shape.
+    if from_lsn.nil? && to_lsn.nil?
+      mismatches = Trino.execute(<<~SQL, env)["data"].flatten.first
+        SELECT count(*)
+          FROM (
+            SELECT coalesce(r.order_id, c.order_id) AS order_id
+              FROM #{target} r
+              FULL OUTER JOIN iceberg.silver.orders_current c
+                ON r.order_id = c.order_id
+             WHERE r.order_id IS NULL
+                OR c.order_id IS NULL
+                OR r.is_deleted IS DISTINCT FROM c.is_deleted
+                OR r.status IS DISTINCT FROM c.status
+                OR r.total_amount IS DISTINCT FROM c.total_amount
+                OR r.customer_id IS DISTINCT FROM c.customer_id
+                OR r.currency IS DISTINCT FROM c.currency
+                OR r.last_lsn IS DISTINCT FROM c.last_lsn
+                OR r.last_event_id IS DISTINCT FROM c.last_event_id
+          ) mismatches
+      SQL
+      abort("Full replay #{replay_id} differs from silver.orders_current in #{mismatches} keys.") if mismatches.to_i.positive?
+      puts "Full replay #{replay_id} matches silver.orders_current exactly."
+    end
   end
 end
 
@@ -165,12 +201,19 @@ namespace :query do
     full = File.join(Config::ROOT, relative)
     abort("SQL file not found: #{relative}") unless File.exist?(full)
 
-    sql = File.read(full)
-    result = Trino.execute_file(full, env)
+    statements = Trino.split_statements(File.read(full))
+    query_id = nil
 
-    puts sql.strip
-    puts "\n-- result"
-    result["data"].each { |page| page.each { |row| puts row.join(" | ") } }
-    puts "\n(query #{result['query_id']})"
+    # One block per statement, labelled with its leading comment. Printing the
+    # whole file once and then a flat result stream made multi-section reports
+    # such as reconciliation.sql impossible to read.
+    statements.each do |statement|
+      result = Trino.execute(statement, env)
+      query_id = result["query_id"]
+      puts "\n-- #{Trino.statement_label(statement)}"
+      result["data"].each { |page| page.each { |row| puts row.join(" | ") } }
+    end
+
+    puts "\n(query #{query_id})"
   end
 end
