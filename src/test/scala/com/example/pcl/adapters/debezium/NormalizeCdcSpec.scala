@@ -14,36 +14,45 @@ class NormalizeCdcSpec extends AnyFlatSpec with Matchers {
     s"""{
        |  "before": null,
        |  "after": { "order_id": 1001, "customer_id": 501, "status": "NEW", "total_amount": "$amount" },
-       |  "source": { "lsn": $lsn, "txId": 900, "db": "pcl", "schema": "public", "table": "orders" },
+       |  "source": {
+       |    "lsn": $lsn, "txId": 900, "sequence": "[\\"24023119\\",\\"24023128\\"]",
+       |    "db": "pcl", "schema": "public", "table": "orders", "ts_ms": 1767225600000
+       |  },
        |  "op": "c",
-       |  "ts_ms": 1767225600000
+       |  "ts_ms": 1767225600123
        |}""".stripMargin
 
   private def update(lsn: Long = 200L, amount: String = "349.00"): String =
     s"""{
        |  "before": { "order_id": 1002, "customer_id": 502, "status": "PAID", "total_amount": "340.00" },
        |  "after": { "order_id": 1002, "customer_id": 502, "status": "PAID", "total_amount": "$amount" },
-       |  "source": { "lsn": $lsn, "txId": 901, "db": "pcl", "schema": "public", "table": "orders" },
+       |  "source": {
+       |    "lsn": $lsn, "txId": 901, "sequence": "[\\"24023130\\",\\"24023135\\"]",
+       |    "db": "pcl", "schema": "public", "table": "orders", "ts_ms": 1767225601000
+       |  },
        |  "op": "u",
-       |  "ts_ms": 1767225601000
+       |  "ts_ms": 1767225601123
        |}""".stripMargin
 
   private def delete(lsn: Long = 300L): String =
     s"""{
        |  "before": { "order_id": 1004, "customer_id": 501, "status": "SHIPPED", "total_amount": "210.00" },
        |  "after": null,
-       |  "source": { "lsn": $lsn, "txId": 902, "db": "pcl", "schema": "public", "table": "orders" },
+       |  "source": {
+       |    "lsn": $lsn, "txId": 902, "sequence": "[\\"24023140\\",\\"24023141\\"]",
+       |    "db": "pcl", "schema": "public", "table": "orders", "ts_ms": 1767225602000
+       |  },
        |  "op": "d",
-       |  "ts_ms": 1767225602000
+       |  "ts_ms": 1767225602123
        |}""".stripMargin
 
   private def snapshotRow(lsn: Long = 10L): String =
     s"""{
        |  "before": null,
        |  "after": { "order_id": 1005, "customer_id": 504, "status": "CANCELLED", "total_amount": "99.99" },
-       |  "source": { "lsn": $lsn, "db": "pcl", "schema": "public", "table": "orders" },
+       |  "source": { "lsn": $lsn, "db": "pcl", "schema": "public", "table": "orders", "ts_ms": 1767225603000 },
        |  "op": "r",
-       |  "ts_ms": 1767225603000
+       |  "ts_ms": 1767225603123
        |}""".stripMargin
 
   "NormalizeCdc" should "map an insert to a canonical CREATE" in {
@@ -81,6 +90,34 @@ class NormalizeCdcSpec extends AnyFlatSpec with Matchers {
 
     event.operation shouldBe Operation.SnapshotRead
     event.isSnapshot shouldBe true
+  }
+
+  it should "use source.ts_ms as the database time and top-level ts_ms as the connector time" in {
+    val Right(event) = NormalizeCdc.normalize(insert(), Source)
+
+    event.sourceTimestamp shouldBe 1767225600000L
+    event.connectorTimestamp shouldBe 1767225600123L
+  }
+
+  it should "parse the intra-transaction ordinal from the sequence array" in {
+    val Right(event) = NormalizeCdc.normalize(insert(), Source)
+
+    event.sourcePosition.sequenceNo shouldBe Some(24023128L)
+  }
+
+  it should "carry the raw reference supplied by the Kafka reader" in {
+    val Right(event) =
+      NormalizeCdc.normalize(insert(), Source, rawReference = Some("pcl.public.orders:0:42"))
+
+    event.rawReference shouldBe Some("pcl.public.orders:0:42")
+  }
+
+  it should "honour a configured primary key column" in {
+    val renamed = insert().replace("\"order_id\": 1001", "\"id\": 1001")
+
+    NormalizeCdc
+      .normalize(renamed, Source, primaryKeyColumns = List("id"))
+      .map(_.primaryKey.values) shouldBe Right(Map("id" -> "1001"))
   }
 
   it should "derive the same event id for the same change" in {
@@ -148,10 +185,14 @@ class NormalizeCdcSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "reject an event with no source metadata" in {
-    val noSource = insert().replace(
-      """"source": { "lsn": 100, "txId": 900, "db": "pcl", "schema": "public", "table": "orders" }""",
-      """"source": null"""
-    )
+    val noSource =
+      """{
+        |  "before": null,
+        |  "after": { "order_id": 1001, "customer_id": 501, "status": "NEW", "total_amount": "120.50" },
+        |  "source": null,
+        |  "op": "c",
+        |  "ts_ms": 1767225600123
+        |}""".stripMargin
     NormalizeCdc.normalize(noSource, Source) match {
       case Left(rejection) => rejection.reason shouldBe ReasonCode.MissingSourceIdentity
       case Right(event)    => fail(s"expected rejection, got $event")

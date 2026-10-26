@@ -27,8 +27,11 @@ CREATE SCHEMA IF NOT EXISTS ops;
 -- raw.order_cdc_events: append-only history
 --
 -- Every accepted event lands here and is never overwritten. This table is the
--- source of truth for replay and reconciliation.
--- `batch_id` ties a row to the run/microbatch that produced it.
+-- audit trail for replay and reconciliation.
+-- `batch_id` identifies the pipeline run that produced the row. Kafka at-least-once
+-- delivery (or a restart without committed offsets) can append the same `event_id`
+-- more than once; readers must deduplicate by `event_id` (see materialize_orders.sql
+-- and reconciliation.sql).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS raw.order_cdc_events (
     event_id               VARCHAR        NOT NULL,
@@ -41,6 +44,7 @@ CREATE TABLE IF NOT EXISTS raw.order_cdc_events (
     tx_id                  VARCHAR,
     seq_no                 BIGINT,
     source_timestamp       TIMESTAMP(6),
+    connector_timestamp    TIMESTAMP(6),
     is_snapshot            BOOLEAN        NOT NULL,
     before_image           MAP(VARCHAR, VARCHAR),
     after_image            MAP(VARCHAR, VARCHAR),
@@ -74,6 +78,8 @@ CREATE TABLE IF NOT EXISTS silver.orders_current (
     last_tx_id     VARCHAR,
     last_seq_no    BIGINT,
     last_event_id  VARCHAR        NOT NULL,
+    last_operation VARCHAR        NOT NULL,
+    last_source_timestamp TIMESTAMP(6),
     updated_at     TIMESTAMP(6)   NOT NULL,
     batch_id       VARCHAR        NOT NULL
 ) WITH (

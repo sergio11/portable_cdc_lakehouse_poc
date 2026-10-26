@@ -23,15 +23,29 @@ final case class DebeziumEnvelope(
     tsMs: Option[Long]
 )
 
-/** Source-position metadata carried by every Debezium event. */
+/** Source-position metadata carried by every Debezium event.
+  *
+  * PostgreSQL emits `sequence` as a JSON array serialised into a string, for example
+  * `"[\"24023119\",\"24023128\"]"`. The last element is the intra-transaction ordinal that
+  * disambiguates changes sharing one LSN. `sequenceNo` exposes that ordinal as a number.
+  */
 final case class DebeziumSource(
     lsn: Option[Long],
     txId: Option[Long],
-    sequenceNo: Option[String],
+    sequence: Option[String],
     db: Option[String],
     schema: Option[String],
-    table: Option[String]
-)
+    table: Option[String],
+    tsMs: Option[Long]
+) {
+
+  /** Last numeric element of Debezium's `sequence` array, or `None` when absent/malformed. */
+  lazy val sequenceNo: Option[Long] =
+    sequence.flatMap { raw =>
+      val numbers = "\\d+".r.findAllIn(raw).toVector
+      numbers.lastOption.flatMap(_.toLongOption)
+    }
+}
 
 object DebeziumEnvelope {
 
@@ -105,14 +119,24 @@ object DebeziumEnvelope {
             fields.get(name).flatMap(_.asNumber).flatMap(_.toLong)
           def text(name: String): Option[String] = fields.get(name).flatMap(_.asString)
 
+          // `sequence` is normally a stringified JSON array. Tolerate a real array as well,
+          // because some converter configurations preserve the JSON structure.
+          def sequence: Option[String] =
+            fields.get("sequence").flatMap { value =>
+              value.asString.orElse(
+                value.asArray.map(_.flatMap(_.asString).mkString("[", ",", "]"))
+              )
+            }
+
           Right(
             DebeziumSource(
               lsn = long("lsn"),
               txId = long("txId"),
-              sequenceNo = text("sequenceNo"),
+              sequence = sequence,
               db = text("db"),
               schema = text("schema"),
-              table = text("table")
+              table = text("table"),
+              tsMs = long("ts_ms")
             )
           )
       }

@@ -20,6 +20,20 @@ class SourcePositionSpec extends AnyFlatSpec with Matchers {
     a.comparePosition(b) should be < 0
   }
 
+  it should "compare numeric transaction ids by value, not by string length" in {
+    val older = SourcePosition(10L, Some("999"), None)
+    val newer = SourcePosition(10L, Some("1000"), None)
+
+    older.comparePosition(newer) should be < 0
+    newer.comparePosition(older) should be > 0
+  }
+
+  it should "fall back to string comparison for non-numeric transaction ids" in {
+    val a = SourcePosition(10L, Some("tx-a"), None)
+    val b = SourcePosition(10L, Some("tx-b"), None)
+    a.comparePosition(b) should be < 0
+  }
+
   it should "break remaining ties with the intra-transaction ordinal" in {
     val a = SourcePosition(10L, Some("1"), Some(1L))
     val b = SourcePosition(10L, Some("1"), Some(2L))

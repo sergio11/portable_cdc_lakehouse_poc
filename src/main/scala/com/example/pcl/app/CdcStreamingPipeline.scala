@@ -7,7 +7,7 @@ import com.example.pcl.domain.rule.EventIdentity
 import org.apache.beam.runners.direct.DirectRunner
 import org.apache.beam.sdk.Pipeline
 import org.apache.beam.sdk.io.iceberg.{IcebergCatalogConfig, IcebergIO}
-import org.apache.beam.sdk.io.kafka.KafkaIO
+import org.apache.beam.sdk.io.kafka.{KafkaIO, KafkaRecord}
 import org.apache.beam.sdk.metrics.{Metrics, MetricsFilter}
 import org.apache.beam.sdk.options.{PipelineOptions, PipelineOptionsFactory}
 import org.apache.beam.sdk.schemas.Schema
@@ -15,7 +15,7 @@ import org.apache.beam.sdk.schemas.logicaltypes.SqlTypes
 import org.apache.beam.sdk.transforms.DoFn
 import org.apache.beam.sdk.transforms.DoFn.ProcessElement
 import org.apache.beam.sdk.transforms.ParDo
-import org.apache.beam.sdk.values.{KV, PCollectionTuple, Row, TupleTag, TupleTagList}
+import org.apache.beam.sdk.values.{PCollectionTuple, Row, TupleTag, TupleTagList}
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.iceberg.catalog.TableIdentifier
 
@@ -24,7 +24,8 @@ import java.time.LocalDateTime
 import java.time.ZoneOffset
 import scala.jdk.CollectionConverters._
 
-/** Shared Beam graph for reading Kafka CDC, validating events, and writing Iceberg history or DLQ. */
+/** Shared Beam graph for reading Kafka CDC, validating events, and writing Iceberg history or DLQ.
+  */
 object CdcStreamingPipeline {
 
   private val RawTag          = new TupleTag[Row]() {}
@@ -50,6 +51,7 @@ object CdcStreamingPipeline {
     .addNullableField("tx_id", Schema.FieldType.STRING)
     .addNullableField("seq_no", Schema.FieldType.INT64)
     .addField("source_timestamp", IcebergTimestampType.withNullable(true))
+    .addField("connector_timestamp", IcebergTimestampType.withNullable(true))
     .addBooleanField("is_snapshot")
     .addField("before_image", ImageType)
     .addField("after_image", ImageType)
@@ -134,12 +136,14 @@ object CdcStreamingPipeline {
           .withMaxNumRecords(settings.maxRecords)
           .withMaxReadTime(org.joda.time.Duration.standardSeconds(60))
       else kafkaRead
-    val messages = pipeline.apply("Read Debezium topic", limitedRead.withoutMetadata())
+    // Keep Kafka metadata: it becomes the raw reference (topic:partition:offset), which is the
+    // only stable pointer back to the original record when replaying or investigating a row.
+    val messages = pipeline.apply("Read Debezium topic", limitedRead)
 
     val routed: PCollectionTuple = messages.apply(
       "Normalize and validate Debezium envelopes",
       ParDo
-        .of(new NormalizeToRows(settings.sourceId, settings.runId))
+        .of(new NormalizeToRows(settings.sourceId, settings.runId, settings.primaryKeyColumns))
         .withOutputTags(RawTag, TupleTagList.of(DeadLetterTag))
     )
 
@@ -179,6 +183,19 @@ object CdcStreamingPipeline {
     catalogProperties.put("type", "rest")
     catalogProperties.put("uri", settings.icebergCatalogUri)
     catalogProperties.put("warehouse", settings.icebergWarehouse)
+    // Polaris authenticates every catalog call with OAuth2 client credentials.
+    // The token endpoint lives under the catalog base URI, and the scope is the
+    // Polaris principal role that owns the catalog.
+    catalogProperties.put("rest.auth.type", "oauth2")
+    catalogProperties.put(
+      "credential",
+      s"${settings.polarisClientId}:${settings.polarisClientSecret}"
+    )
+    catalogProperties.put(
+      "oauth2-server-uri",
+      s"${settings.icebergCatalogUri.stripSuffix("/")}/v1/oauth/tokens"
+    )
+    catalogProperties.put("scope", "PRINCIPAL_ROLE:ALL")
     catalogProperties.put("io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
     catalogProperties.put("s3.endpoint", settings.s3Endpoint)
     catalogProperties.put("s3.path-style-access", "true")
@@ -194,34 +211,46 @@ object CdcStreamingPipeline {
       .build()
   }
 
-  private final class NormalizeToRows(sourceId: String, runId: String)
-      extends DoFn[KV[String, String], Row] {
+  private final class NormalizeToRows(
+      sourceId: String,
+      runId: String,
+      primaryKeyColumns: List[String]
+  ) extends DoFn[KafkaRecord[String, String], Row] {
 
     @ProcessElement
     def processElement(context: ProcessContext): Unit = {
-      val payload = context.element().getValue
+      val record       = context.element()
+      val payload      = record.getKV.getValue
+      val rawReference = s"${record.getTopic}:${record.getPartition}:${record.getOffset}"
+
       // Debezium emits a Kafka tombstone after a delete envelope. It has no CDC meaning and is
       // skipped; the delete envelope itself was already routed through NormalizeCdc.
       if (payload != null)
-        NormalizeCdc.normalize(payload, sourceId) match {
+        NormalizeCdc.normalize(payload, sourceId, primaryKeyColumns, Some(rawReference)) match {
           case Right(event) =>
             AcceptedEvents.inc()
-            context.output(RawTag, toRawRow(event, payload, runId))
+            context.output(RawTag, toRawRow(event, runId))
           case Left(reason) =>
             RejectedEvents.inc()
-            context.output(DeadLetterTag, toDeadLetterRow(reason, payload, runId))
+            context.output(
+              DeadLetterTag,
+              toDeadLetterRow(reason.copy(rawReference = Some(rawReference)), payload, runId)
+            )
         }
       else KafkaTombstones.inc()
     }
   }
 
-  private def toRawRow(event: CdcEvent, raw: String, batchId: String): Row = {
+  private def toRawRow(event: CdcEvent, batchId: String): Row = {
     val before = event.before.map(_.asJava).orNull
     val after  = event.after.map(_.asJava).orNull
-    val sourceTimestamp = LocalDateTime.ofInstant(
-      Instant.ofEpochMilli(event.sourceTimestamp),
-      ZoneOffset.UTC
-    )
+    def timestamp(millis: Long): LocalDateTime =
+      LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneOffset.UTC)
+
+    // A missing timestamp is represented as null, not as 1970-01-01.
+    def optionalTimestamp(millis: Long): LocalDateTime =
+      if (millis > 0L) timestamp(millis) else null
+
     val ingestedAt = LocalDateTime.ofInstant(Instant.now(), ZoneOffset.UTC)
 
     Row
@@ -236,7 +265,8 @@ object CdcStreamingPipeline {
         Long.box(event.sourcePosition.lsn),
         event.transactionId.orNull,
         event.sourcePosition.sequenceNo.map(Long.box).orNull,
-        sourceTimestamp,
+        optionalTimestamp(event.sourceTimestamp),
+        optionalTimestamp(event.connectorTimestamp),
         Boolean.box(event.isSnapshot),
         before,
         after,

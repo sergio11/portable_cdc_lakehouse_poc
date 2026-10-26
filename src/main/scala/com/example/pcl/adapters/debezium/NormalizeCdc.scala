@@ -4,7 +4,9 @@ import com.example.pcl.adapters.debezium.DebeziumEnvelope.DecodeFailure
 import com.example.pcl.domain.model._
 import com.example.pcl.domain.rule.{EventIdentity, ValidateEvent}
 
-/** Converts Debezium envelopes into canonical events and derives operation, identity, and snapshot fields. */
+/** Converts Debezium envelopes into canonical events and derives operation, identity, and snapshot
+  * fields.
+  */
 object NormalizeCdc {
 
   /** Debezium operation codes mapped to the canonical operation vocabulary. */
@@ -15,19 +17,28 @@ object NormalizeCdc {
     "r" -> Operation.SnapshotRead
   )
 
-  /** Columns that identify a row. Configured, not hard-coded per table. */
-  private val PrimaryKeyColumns = List("order_id")
+  /** Default identity columns for the sample table. Callers can override them through
+    * `PCL_PRIMARY_KEY_COLUMNS`, so the adapter is not tied to `orders`.
+    */
+  val DefaultPrimaryKeyColumns: List[String] = List("order_id")
 
-  def normalize(json: String, sourceId: String): Either[Rejection, CdcEvent] =
+  def normalize(
+      json: String,
+      sourceId: String,
+      primaryKeyColumns: List[String] = DefaultPrimaryKeyColumns,
+      rawReference: Option[String] = None
+  ): Either[Rejection, CdcEvent] =
     DebeziumEnvelope
       .decode(json)
       .left
       .map(failure => toRejection(failure))
-      .flatMap(envelope => normalizeEnvelope(envelope, sourceId))
+      .flatMap(envelope => normalizeEnvelope(envelope, sourceId, primaryKeyColumns, rawReference))
 
   def normalizeEnvelope(
       envelope: DebeziumEnvelope,
-      sourceId: String
+      sourceId: String,
+      primaryKeyColumns: List[String] = DefaultPrimaryKeyColumns,
+      rawReference: Option[String] = None
   ): Either[Rejection, CdcEvent] =
     operationFor(envelope).flatMap { operation =>
       if (operation == Operation.Delete && envelope.before.isEmpty && envelope.after.isEmpty)
@@ -39,8 +50,8 @@ object NormalizeCdc {
         )
       else
         for {
-          key   <- primaryKeyFor(envelope, operation)
-          event <- toEvent(envelope, operation, key, sourceId)
+          key   <- primaryKeyFor(envelope, operation, primaryKeyColumns)
+          event <- toEvent(envelope, operation, key, sourceId, rawReference)
           valid <- ValidateEvent.validate(event)
         } yield valid
     }
@@ -65,27 +76,35 @@ object NormalizeCdc {
 
   private def primaryKeyFor(
       envelope: DebeziumEnvelope,
-      operation: Operation
+      operation: Operation,
+      primaryKeyColumns: List[String]
   ): Either[Rejection, EntityKey] = {
-    val values = PrimaryKeyColumns.flatMap { column =>
-      rowImage(envelope, operation).flatMap(_.get(column)).map(column -> _)
-    }
+    val image   = rowImage(envelope, operation)
+    val missing = primaryKeyColumns.filterNot(column => image.exists(_.contains(column)))
 
-    if (values.isEmpty)
+    // A composite key is only meaningful when every configured column is present.
+    // Accepting a subset would silently collapse distinct rows into one identity.
+    if (missing.nonEmpty)
       Left(
         Rejection(
           ReasonCode.MissingPrimaryKey,
-          s"none of ${PrimaryKeyColumns.mkString(",")} present in the row image"
+          s"missing key columns in the row image: ${missing.mkString(",")}"
         )
       )
-    else Right(EntityKey(values.toMap))
+    else
+      Right(
+        EntityKey(
+          primaryKeyColumns.map(column => column -> image.getOrElse(Map.empty)(column)).toMap
+        )
+      )
   }
 
   private def toEvent(
       envelope: DebeziumEnvelope,
       operation: Operation,
       key: EntityKey,
-      sourceId: String
+      sourceId: String,
+      rawReference: Option[String]
   ): Either[Rejection, CdcEvent] = {
     val schemaName = envelope.source.schema.getOrElse("")
     val tableName  = envelope.source.table.getOrElse("")
@@ -93,8 +112,13 @@ object NormalizeCdc {
     val position = SourcePosition(
       lsn = envelope.source.lsn.getOrElse(0L),
       txId = envelope.source.txId.map(_.toString),
-      sequenceNo = envelope.source.sequenceNo.flatMap(_.toLongOption)
+      sequenceNo = envelope.source.sequenceNo
     )
+
+    // `source.ts_ms` is the database change time. The top-level `ts_ms` is when the
+    // connector processed the record, which is a different measurement. Keep both.
+    val databaseTimestamp  = envelope.source.tsMs.orElse(envelope.tsMs).getOrElse(0L)
+    val connectorTimestamp = envelope.tsMs.getOrElse(0L)
 
     Right(
       CdcEvent(
@@ -104,7 +128,7 @@ object NormalizeCdc {
         primaryKey = key,
         operation = operation,
         sourcePosition = position,
-        sourceTimestamp = envelope.tsMs.getOrElse(0L),
+        sourceTimestamp = databaseTimestamp,
         transactionId = envelope.source.txId.map(_.toString),
         // PostgreSQL snapshot rows share one LSN/transaction position. Include the canonical key
         // so distinct rows at that position do not collapse into one event identity.
@@ -119,7 +143,8 @@ object NormalizeCdc {
         before = envelope.before,
         after = envelope.after,
         isSnapshot = envelope.op == "r",
-        rawReference = None
+        rawReference = rawReference,
+        connectorTimestamp = connectorTimestamp
       )
     )
   }
