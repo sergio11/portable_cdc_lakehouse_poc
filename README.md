@@ -4,7 +4,7 @@
 
 Portable CDC Lakehouse is a local Proof of Concept (POC) for capturing database changes, processing them as a stream, and storing both change history and current state in an open table format.
 
-It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Flink, Apache Iceberg, MinIO, and Trino. The same Beam graph has been exercised with DirectRunner and the classic FlinkRunner on separate JobManager and TaskManager containers.
+It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Flink, Apache Iceberg, Apache Polaris, MinIO, and Trino. The same Beam graph has been exercised with DirectRunner and the classic FlinkRunner on separate JobManager and TaskManager containers.
 
 ## ⚠️ Disclaimer
 
@@ -52,10 +52,10 @@ flowchart LR
     TRINO --> SILVER
     TRINO --> REPLAY_TABLE
 
-    CAT[Iceberg REST catalog<br/>SQLite metadata] --- RAW
-    CAT --- DLQ
-    CAT --- SILVER
-    CAT --- REPLAY_TABLE
+    POL[Apache Polaris<br/>Iceberg REST catalog<br/>Postgres metastore] --- RAW
+    POL --- DLQ
+    POL --- SILVER
+    POL --- REPLAY_TABLE
     MINIO[(MinIO<br/>S3-compatible object store)] --- RAW
     MINIO --- DLQ
     MINIO --- SILVER
@@ -66,8 +66,8 @@ flowchart LR
 
 1. PostgreSQL writes changes to its logical WAL. Debezium reads those changes and publishes envelopes to Kafka.
 2. Beam reads the topic, ignores Kafka's null-value delete markers, normalizes Debezium envelopes, and routes valid events to raw history and invalid envelopes to the dead-letter table.
-3. With DirectRunner, the Beam process executes locally in its temporary container. With FlinkRunner, that container submits the job and waits while Flink executes Beam operators in the TaskManager. In continuous mode, the submitter and Flink services stay active until the job is stopped.
-4. Trino runs an idempotent `MERGE` from raw history into `silver.orders_current`, keeping the highest source position per order. Deletes become versioned tombstones.
+3. With DirectRunner, the Beam process executes locally in its temporary container. With FlinkRunner, that container submits the job and waits while Flink executes Beam operators in the TaskManager. The streaming job checkpoints every 10 seconds with RocksDB and externalized checkpoints, so a restart has a durable state snapshot. In continuous mode, the submitter and Flink services stay active until the job is stopped.
+4. Trino runs an idempotent `MERGE` from raw history into `silver.orders_current`, keeping the highest source position per order. Deletes become versioned tombstones. Raw rows are deduplicated by `event_id` before ranking, because Kafka delivery is at-least-once.
 5. `lakehouse:replay` creates an isolated target table and rebuilds it from all raw events or an inclusive LSN range. It does not update the canonical current-state table.
 6. Trino queries inspect the Iceberg tables, snapshots, counts, and reconciliation discrepancies.
 
@@ -122,9 +122,9 @@ Iceberg stores both the append-only event history and the current-state projecti
 
 MinIO gives Beam and Trino a shared S3 API endpoint without requiring a cloud account. Iceberg data files live in its persistent Podman volume. The POC builds a pinned upstream MinIO release locally because the upstream community container image is no longer published; this is documented as an implementation constraint.
 
-### 📚 Iceberg REST catalog with SQLite — shared table metadata
+### 📚 Apache Polaris — shared Iceberg REST catalog
 
-Beam and Trino need to resolve the same Iceberg tables and snapshots. The REST catalog fixture provides that shared catalog endpoint, and its SQLite database is persisted in a Podman volume. SQLite and the fixture image keep the local demo self-contained; this catalog setup is not intended as a production metadata service.
+Beam and Trino need to resolve the same Iceberg tables and snapshots. Apache Polaris provides the REST catalog endpoint, and its metadata lives in a dedicated `polaris` database inside the same PostgreSQL instance as the source (schema `polaris_schema`). That removes the SQLite fixture from the POC and makes catalog state survive container restarts. Polaris authenticates clients with OAuth2 client credentials; both Beam and Trino exchange them for short-lived tokens. MinIO does not implement STS, so the catalog is created with `stsUnavailable=true` and credential vending disabled: each client uses its own S3 credentials for data files.
 
 ### 🔎 Trino — SQL materialization and inspection
 
@@ -145,7 +145,8 @@ Podman runs the services and job containers without requiring Docker Engine. Com
 | Beam FlinkRunner / Apache Flink | 2.76.0 (`beam-runners-flink-2.2`) / 2.2.1 | Bounded job completed on Podman JobManager and TaskManager |
 | PostgreSQL / Kafka | 17.2 / 3.9.1 | Source CDC and topic exercised |
 | Debezium Connect | 3.2.4.Final | PostgreSQL connector task reached RUNNING |
-| Apache Iceberg / Iceberg REST fixture | 1.11.0 / 1.10.1 | Beam write, Trino read, REST catalog shared |
+| Apache Iceberg | 1.11.0 | Beam write, Trino read, shared REST catalog |
+| Apache Polaris | 1.8.0 | OAuth2 catalog API, Postgres metastore, MinIO storage |
 | Trino | 476 | Table creation, materialization, and SQL inspection |
 | MinIO | `RELEASE.2025-10-15T17-29-55Z`, built with Go 1.24.8 | Bucket and Iceberg object writes exercised |
 | AWS CLI | 2.27.41 | MinIO bucket bootstrap |
@@ -156,24 +157,45 @@ The FlinkRunner artifact family matches Flink 2.2.x, and [Beam's compatibility t
 
 | Table | Purpose | Important behavior |
 |---|---|---|
-| `raw.order_cdc_events` | Canonical append-only history | Stores source, key, operation, source position, before/after images, snapshot flag, batch ID, and event ID. |
-| `silver.orders_current` | Current state for each order | One row per order; latest source position wins; deletes remain as `is_deleted=true` tombstones. |
+| `raw.order_cdc_events` | Canonical append-only history | Stores source, key, operation, source position, before/after images, snapshot flag, `source_timestamp`, `connector_timestamp`, `raw_reference` (`topic:partition:offset`), batch ID, and event ID. |
+| `silver.orders_current` | Current state for each order | One row per order; latest source position wins; deletes remain as `is_deleted=true` tombstones; `last_operation` and `last_source_timestamp` describe the winning event. |
 | `ops.cdc_dead_letter` | Invalid input inspection | Stores the reason code and payload for invalid Debezium envelopes. |
 | `silver.orders_current_replay_<id>` | Isolated replay result | A run-scoped target created by `rake lakehouse:replay`; the canonical projection is left untouched. |
 
-Ordering uses LSN and transaction/sequence tie-breakers where available. Event time and arrival time are not used as the sole precedence rule. Snapshot rows are marked distinctly; deterministic event IDs include the primary key because PostgreSQL snapshot rows can share a source position.
+Ordering uses LSN, then the numeric transaction id, then the intra-transaction `sequence` ordinal, then the deterministic event id. Event time and arrival time are not used as the sole precedence rule. Snapshot rows are marked distinctly; deterministic event IDs include the primary key because PostgreSQL snapshot rows can share a source position.
+
+`raw.order_cdc_events` is append-only by design. At-least-once Kafka delivery or a restart without committed offsets can append the same `event_id` more than once; materialization and reconciliation therefore deduplicate by `event_id` before ranking, keeping the newest `ingested_at` copy. The duplicate-delivery report in `sql/reconciliation.sql` makes that visible instead of hiding it.
+
+## 🛠️ Correctness fixes applied
+
+The first version of the POC exposed several correctness problems. They were fixed in the code and, where possible, covered by tests:
+
+| Problem | Correction |
+|---|---|
+| Debezium's PostgreSQL field is `sequence`, not `sequenceNo` | `DebeziumSource` decodes `sequence`, tolerates a stringified array or a real array, and exposes the last numeric element as `sequenceNo`. |
+| The top-level `ts_ms` was used as the database change time | `sourceTimestamp` now comes from `source.ts_ms`; the top-level value is stored separately as `connectorTimestamp`. |
+| Transaction ids were compared as strings (`"999"` > `"1000"`) | `SourcePosition.comparePosition` parses numeric transaction ids and falls back to string comparison only for non-numeric ids. |
+| Primary-key columns were hard-coded to `order_id` | `PCL_PRIMARY_KEY_COLUMNS` configures the key columns passed to the normalizer. |
+| `raw_reference` was never populated | The Kafka reader now sets it to `topic:partition:offset` for accepted and rejected records. |
+| The Flink job had no checkpointing | The cluster and the Beam submission use 10-second `EXACTLY_ONCE` checkpoints, RocksDB state, and externalized checkpoints. |
+| Append-only history could contain duplicate events | Materialization and reconciliation deduplicate by `event_id` before ranking; the duplicate report surfaces repeated delivery. |
+| Replay reused an existing table | `lakehouse:replay` drops and recreates its isolated target on every run. |
+| Polaris `catalog_admin` does not include data-write, and drop-with-purge is off by default, so only the first replay could drop its target | `polaris-setup` grants `CATALOG_MANAGE_CONTENT` and sets `polaris.config.drop-with-purge.enabled=true` on the catalog, so drops with purge work on every run. |
+| Reconciliation only compared key counts | It now compares business columns, tombstone state, operation, and source position, and a full replay must match the live projection exactly. |
 
 ## 🚀 Quick start
 
-From Windows PowerShell, copy `.env.example` to `.env` and set the local PostgreSQL and MinIO passwords. Start the services and prepare the CDC source:
+From Windows PowerShell, copy `.env.example` to `.env` and set the local PostgreSQL, MinIO, and Polaris passwords. Start the services and prepare the CDC source:
 
 ```powershell
 Copy-Item .env.example .env
-bundle exec rake infra:up
-bundle exec rake lakehouse:init
-bundle exec rake debezium:register
+bundle exec rake infra:up          # starts Postgres, Kafka, MinIO, Polaris, Connect, Trino
+bundle exec rake lakehouse:init    # creates the raw/silver/ops Iceberg namespaces and tables
+bundle exec rake debezium:register # registers the PostgreSQL connector
 bundle exec rake fixtures:scenarios
 ```
+
+`infra:up` starts PostgreSQL first, ensures the `polaris` database and `polaris_schema` exist, then starts the rest of the stack. The one-shot `polaris-setup` container creates the `pcl` catalog idempotently. Polaris listens on `http://localhost:8181/api/catalog`; its health endpoint is `http://localhost:8182/q/health`.
 
 Launch the unbounded Beam job. It keeps reading CDC events from Kafka and writing them to Iceberg until you stop the Flink cluster:
 
@@ -188,45 +210,120 @@ The `silver.orders_current` projection is refreshed separately; in a second wind
 
 ## 📸 Results from the running POC
 
-Evidence captured from the active Podman cluster on **24 October 2026**:
+The screenshots and outputs below come from one continuous session on 26 October 2026. The same Beam graph ran first with DirectRunner and then as an unbounded streaming job on a separate Flink cluster, both writing to the same Iceberg tables through Apache Polaris.
+
+### 1. Apache Polaris owns the catalog
+
+`rake infra:up` starts PostgreSQL first, creates the `polaris` database and schema, bootstraps the `POLARIS` realm, creates the `pcl` catalog, grants the content privilege that Trino needs to drop tables with purge, and only then starts Trino. Every step is idempotent:
 
 ```text
-$ bundle exec rake infra:status
-8 containers running: PostgreSQL, Kafka, MinIO, Iceberg REST, Trino,
-Kafka Connect, Flink JobManager, and Flink TaskManager
+$ rake infra:up
+Created MinIO bucket 'pcl-warehouse'.
 
-$ PCL_MAX_RECORDS=0 bundle exec rake pipeline:flink
-{"component":"CdcStreamingPipeline", ... ,"status":"running"}
-
-$ Flink REST after 90 seconds
-state=RUNNING  tasks=5/5 running  failed=0
-
-$ bundle exec rake pipeline:flink:stop (second PowerShell window)
-Flink JobManager and TaskManager stopped
-
-$ bundle exec rake lakehouse:materialize
-Current-state projection refreshed (query 20261024_130008_00003_22msk).
-
-$ bundle exec rake query:file[sql/reconciliation.sql]
-current state: 6 active orders, 1 delete tombstone
-per-key reconciliation: 7 keys, all position/key checks = ok
-raw history: 52 rows, 13 distinct event IDs (append-only; repeated fixture runs)
-dead-letter rows: 0
-
-$ PCL_REPLAY_ID=readme_proof bundle exec rake lakehouse:replay
-7 keys, 1 tombstone (query 20261024_130215_00011_22msk)
+All services ready.
+  Trino    http://localhost:8080
+  Connect  http://localhost:8083
+  MinIO    http://localhost:9001
+  Polaris  http://localhost:8181/api/catalog
+  Polaris health  http://localhost:8182/q/health
 ```
 
-Replay materialized into its own table, leaving the canonical projection untouched.
+```text
+$ podman logs pcl-polaris-bootstrap
+Realm 'POLARIS' successfully bootstrapped.
+Bootstrap completed successfully.
+
+$ podman logs pcl-polaris-setup
+Requesting a Polaris access token...
+Polaris catalog 'pcl' already exists.
+Polaris catalog role 'catalog_admin' already holds CATALOG_MANAGE_CONTENT.
+Polaris catalog 'pcl' already enables drop-with-purge.
+```
+
+On a fresh volume the same setup container prints `Created Polaris catalog 'pcl' at s3://pcl-warehouse/warehouse/.`; the lines above are the idempotent re-run.
+
+The realm is stored in PostgreSQL, and the health endpoint reports `UP`:
+
+![Apache Polaris health endpoint](docs/screenshots/01-polaris-health.png)
+
+### 2. Both runners process the same CDC stream
+
+Debezium reports the connector and its single task as `RUNNING`:
+
+```json
+{"name":"pcl-postgres-orders","connector":{"state":"RUNNING"},"tasks":[{"id":0,"state":"RUNNING"}],"type":"source"}
+```
+
+The bounded DirectRunner pass read 15 Kafka records, accepted 13, and counted 2 Kafka tombstones (the key-only delete markers Debezium emits, which carry no payload). It wrote one Iceberg data file:
+
+```text
+elements_read=15  accepted_events=13  kafka_tombstones=2  dataFilesWritten=1
+```
+
+The FlinkRunner job started from the earliest offset because no consumer offsets were committed, so it appended a second batch of 13 accepted events. The audit table now holds 26 rows for 13 distinct event ids, which is the at-least-once behavior the projection is designed to absorb.
+
+The job ran with five operators on the local cluster and 10-second `EXACTLY_ONCE` checkpoints:
+
+![Beam job running on the Flink dashboard](docs/screenshots/03-flink-job-running.png)
+
+85 checkpoints completed; the latest one acknowledged 5/5 subtasks at 421 KB and was written to the external checkpoint directory. The six failures in the history are the first triggers while the job was still deploying (`Not all required tasks are currently running`), not state failures:
+
+![Flink checkpoint history](docs/screenshots/04-flink-checkpoints.png)
+
+### 3. Trino materializes through Polaris
+
+`rake lakehouse:materialize` merges the latest source-positioned event per order. The query detail confirms the MERGE ran through the Polaris REST catalog against `iceberg.silver.orders_current`:
+
+![Trino MERGE query detail](docs/screenshots/02-trino-merge-query.png)
+
+Polaris prefixes each table location with a UUID. The raw table's Parquet and metadata files are visible in the MinIO object browser:
+
+![MinIO object browser with raw order_cdc_events](docs/screenshots/05-minio-raw-data.png)
+
+### 4. Reconciliation and replay
+
+Reconciliation deduplicates by `event_id`, reports the repeated delivery explicitly, and still finds zero discrepancies:
+
+```text
+-- 1. Live vs deleted split of the projection.
+false | 6
+true  | 1
+
+-- 2. Duplicate delivery report.
+13 | 13
+
+-- 5. Discrepancy report.
+1001 | 31461760 | 31461760 | UPDATE | UPDATE | false | false | ok
+1002 | 31462320 | 31462320 | UPDATE | UPDATE | false | false | ok
+1003 | 31461632 | 31461632 | SNAPSHOT_READ | SNAPSHOT_READ | false | false | ok
+1004 | 31462432 | 31462432 | DELETE | DELETE | true | true | ok
+1005 | 31462576 | 31462576 | CREATE | CREATE | false | false | ok
+1006 | 31463104 | 31463104 | CREATE | CREATE | false | false | ok
+1007 | 31463552 | 31463552 | UPDATE | UPDATE | false | false | ok
+```
+
+A full replay into an isolated table reproduces the live projection exactly:
+
+```text
+$ $env:PCL_REPLAY_ID='readme_proof'; rake lakehouse:replay
+Replay readme_proof materialized to iceberg.silver.orders_current_replay_readme_proof: 7 keys, 1 tombstones.
+Full replay readme_proof matches silver.orders_current exactly.
+```
+
+### 5. Terminal evidence
+
+The complete command output for the run is collected in a single capture:
+
+![Terminal evidence for the full run](docs/screenshots/06-terminal-evidence.png)
 
 ## 🔎 What this evidence proves
 
-- PostgreSQL CDC events travel through Debezium and Kafka into Beam, and the FlinkRunner job completes on the local Flink cluster.
-- Trino can materialize and inspect Iceberg current state; deletes are represented as tombstones.
-- The reconciliation report checks expected key presence and source-position agreement. The replay output above checks key and tombstone counts; neither result compares every business column.
-- Raw history is append-only, so repeated fixture runs explain the 52 rows for 13 distinct event IDs.
+- PostgreSQL CDC events travel through Debezium and Kafka into Beam, and the FlinkRunner job runs on the local Flink cluster with checkpointing enabled.
+- Trino can materialize and inspect Iceberg current state through Apache Polaris; deletes are represented as tombstones.
+- Reconciliation compares business columns, tombstone state, operation, and source position, not only key counts. A full replay must match the live projection exactly.
+- Raw history is append-only. Repeated delivery is expected under at-least-once processing and is handled by deduplicating on `event_id`; the duplicate report makes it visible.
 
-This is a **proof of concept**, not a production-ready platform. Restart/recovery behavior, full business-value replay comparison, invalid-message integration checks, and performance benchmarking remain unvalidated. Exactly-once processing and production throughput are not claimed.
+This is a **proof of concept**, not a production-ready platform. Restart/recovery behavior is exercised at the checkpoint-configuration level, not through a sustained failure-injection campaign. Invalid-message integration checks and performance benchmarking remain unvalidated. Exactly-once processing and production throughput are not claimed.
 
 ## 📜 License
 
