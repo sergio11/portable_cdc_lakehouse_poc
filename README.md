@@ -4,7 +4,7 @@
 
 Portable CDC Lakehouse is a local Proof of Concept (POC) for capturing database changes, processing them as a stream, and storing both change history and current state in an open table format.
 
-It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Spark, Apache Flink, Apache Iceberg, Apache Polaris, MinIO, and Trino. The same Beam graph has been exercised with DirectRunner and the classic FlinkRunner on separate JobManager and TaskManager containers. Batch transformation runs on Spark, and Trino is strictly read-only.
+It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Spark, Apache Flink, Apache Iceberg, Apache Polaris, MinIO, Trino, and Dagster. The same Beam graph has been exercised with DirectRunner and the classic FlinkRunner on separate JobManager and TaskManager containers. Batch transformation runs on Spark, Dagster runs the incremental graph every five minutes, and Trino is strictly read-only.
 
 ## ⚠️ Disclaimer
 
@@ -40,6 +40,7 @@ The trade-off is explicit: more moving parts (Kafka, Flink, Spark, Iceberg, Pola
 - 🧾 Keep append-only CDC history in Iceberg on MinIO.
 - 🪦 Project the history into one current-state row per order, preserving deletes as versioned tombstones.
 - ⚡ Transform with Spark SQL: Iceberg DDL, an incremental `MERGE`, and replay.
+- 🗓️ Run the incremental graph on a Dagster schedule, with asset checks gating each run.
 - 🔁 Replay raw history into an isolated Iceberg table.
 - 🔎 Serve with Trino, which is configured read-only at the engine level.
 - 📦 Run local dependencies with Podman; operate the POC through Rake commands.
@@ -50,6 +51,10 @@ The trade-off is explicit: more moving parts (Kafka, Flink, Spark, Iceberg, Pola
 flowchart LR
     PG[(PostgreSQL<br/>orders + WAL)] -->|logical decoding| DBZ[Debezium<br/>Kafka Connect]
     DBZ -->|CDC envelopes| K[(Kafka<br/>pcl.public.orders)]
+
+    DAG[Dagster<br/>5-minute schedule] -.->|bounded read| DIRECT
+    DAG -.->|incremental MERGE| SPARK
+    DAG -.->|lag and offsets| K
 
     K --> DIRECT[Beam graph<br/>DirectRunner]
     K --> SUBMIT[Beam job submitter<br/>short-lived container]
@@ -84,15 +89,17 @@ flowchart LR
 
 ### 🔄 Runtime flow
 
-1. PostgreSQL writes changes to its logical WAL. Debezium reads those changes and publishes envelopes to Kafka.
-2. Beam reads the topic, ignores Kafka's null-value delete markers, normalizes Debezium envelopes, and routes valid events to raw history and invalid envelopes to the dead-letter table.
-3. With DirectRunner, the Beam process executes locally in its temporary container. With FlinkRunner, that container submits the job and waits while Flink executes Beam operators in the TaskManager. The streaming job checkpoints every 10 seconds with RocksDB and externalized checkpoints, so a restart has a durable state snapshot. In continuous mode, the submitter and Flink services stay active until the job is stopped.
-4. Spark SQL materializes `silver.orders_current`. It reads the watermark from `ops.materialization_state`, selects the keys that received arrivals since the last run, re-ranks the full history of only those keys, applies an idempotent `MERGE`, and advances the watermark after the commit. Deletes become versioned tombstones. Raw rows are deduplicated by `event_id` before ranking, because Kafka delivery is at-least-once.
-5. `lakehouse:replay` drops and recreates an isolated target table with Spark and rebuilds it from all raw events or an inclusive LSN range. It does not update the canonical current-state table or the watermark.
-6. Trino only reads: it inspects the Iceberg tables, snapshots, counts, and reconciliation discrepancies. Its access control rejects every write operation.
+1. Dagster's five-minute schedule starts a run. The run compares the topic's end offsets with the consumer group's committed offsets, so it knows exactly how many records are pending before starting anything.
+2. PostgreSQL writes changes to its logical WAL. Debezium reads those changes and publishes envelopes to Kafka.
+3. Beam reads the topic, ignores Kafka's null-value delete markers, normalizes Debezium envelopes, and routes valid events to raw history and invalid envelopes to the dead-letter table. The run commits the consumer offsets only when the append succeeded and the number of records read matches the lag; a short read leaves the offsets alone, so the next run re-reads and deduplicates by `event_id`.
+4. With DirectRunner, the Beam process executes locally in its temporary container. With FlinkRunner, that container submits the job and waits while Flink executes Beam operators in the TaskManager. The streaming job checkpoints every 10 seconds with RocksDB and externalized checkpoints, so a restart has a durable state snapshot. In continuous mode, the submitter and Flink services stay active until the job is stopped.
+5. Spark SQL materializes `silver.orders_current`. It reads the watermark from `ops.materialization_state`, selects the keys that received arrivals since the last run, re-ranks the full history of only those keys, applies an idempotent `MERGE`, and advances the watermark after the commit. Deletes become versioned tombstones. Raw rows are deduplicated by `event_id` before ranking, because Kafka delivery is at-least-once. A run with no raw event newer than the watermark skips Spark entirely.
+6. `lakehouse:replay` and `dagster:replay` drop and recreate an isolated target table with Spark and rebuild it from all raw events or an inclusive LSN range. They do not update the canonical current-state table or the watermark.
+7. Trino only reads: it inspects the Iceberg tables, snapshots, counts, and reconciliation discrepancies. Its access control rejects every write operation.
 
 ```mermaid
 sequenceDiagram
+    participant G as Dagster
     participant P as PostgreSQL
     participant D as Debezium
     participant K as Kafka
@@ -103,12 +110,16 @@ sequenceDiagram
     participant S as Iceberg silver (MinIO)
     participant T as Trino (read-only)
 
+    G->>K: Lag = end offset - committed offset
     P->>D: WAL changes
     D->>K: CDC envelope
+    G->>B: Start a bounded Beam read of the lag
     K->>B: Read topic
     Note over B,F: DirectRunner executes locally, or FlinkRunner submits the same graph to Flink
     B->>R: Append valid canonical event
     B->>R: Route invalid envelope to ops dead-letter
+    G->>K: Commit offsets after the append
+    G->>X: Start Spark when raw is newer than the watermark
     X->>R: Read keys changed since the watermark
     X->>S: Idempotent MERGE / versioned tombstone
     X->>S: Advance ops.materialization_state
@@ -157,9 +168,15 @@ Beam, Spark and Trino need to resolve the same Iceberg tables and snapshots. Apa
 
 Trino is the serving layer: it answers business queries, reconciliation, and snapshot inspection. It does not create tables, merge, or replay. The POC mounts Trino's built-in `read-only` system access control, so `INSERT`, `CREATE`, `MERGE`, `DROP`, and `ALTER` are rejected by the engine even if they arrive from the CLI, a notebook, or a BI tool. `rake query:file` adds an allowlist on top of that boundary for a clearer error message.
 
+### 🗓️ Dagster — scheduled orchestration
+
+Dagster is the scheduled entrypoint, not a second implementation: every asset runs the same pinned Spark and Beam containers the Rake tasks run, through the Podman socket. `raw_cdc_events` measures the consumer-group lag with `confluent-kafka`, starts a bounded Beam read of exactly that many records, and commits the offsets only when the append succeeded and the record count matches the lag. A short read leaves the offsets untouched, so the next run re-reads and deduplicates on `event_id`. `orders_current` skips Spark when no raw event arrived after the watermark, so an idle tick costs one query instead of a JVM and an Iceberg overwrite. Two asset checks gate each run: no envelope in the batch was quarantined, and the projection still agrees with the replayed history.
+
+Run and event history live in a `dagster` database inside the same PostgreSQL instance as the source, so the orchestrator survives container restarts without a SQLite file. The webserver runs in Compose; the daemon is started by `rake dagster:up` with the engine client, because podman-compose resolves absolute bind sources with `realpath` on Windows and mounts an empty directory where the Podman socket should be. Replay is deliberately outside the schedule: `rake dagster:replay[id,from_lsn,to_lsn]` runs the replay job with an explicit window.
+
 ### 📦 Podman, Compose, and Rake — reproducible local operations
 
-Podman runs the services and job containers without requiring Docker Engine. Compose describes the pinned services, named data volumes, and optional Flink cluster. Rake provides repeatable commands for startup/readiness, builds, pipeline submission, replay, queries, and shutdown. These tasks orchestrate the workflow; they are not additional runtime services.
+Podman runs the services and job containers without requiring Docker Engine. Compose describes the pinned services, named data volumes, and optional Flink cluster. Rake provides repeatable commands for startup/readiness, builds, pipeline submission, replay, queries, and shutdown. Dagster owns the unattended path; these tasks remain the manual and test path.
 
 ### 📌 Pinned versions and validation
 
@@ -177,6 +194,8 @@ Podman runs the services and job containers without requiring Docker Engine. Com
 | Apache Iceberg | 1.11.0 | Beam write, Spark transform, Trino read |
 | Apache Polaris | 1.8.0 | OAuth2 catalog API, Postgres metastore, MinIO storage |
 | Trino | 476 | Read-only queries, reconciliation, snapshot inspection |
+| Dagster / dagster-postgres | 1.13.27 / 0.29.27 (Python 3.12, SQLAlchemy 2.0.55) | Scheduled runs, asset checks, Postgres-backed history |
+| confluent-kafka (Dagster image) | 2.16.0 | Consumer-group lag measurement and offset commit |
 | MinIO | `RELEASE.2025-10-15T17-29-55Z`, built with Go 1.24.8 | Bucket and Iceberg object writes exercised |
 | AWS CLI | 2.27.41 | MinIO bucket bootstrap |
 
@@ -216,20 +235,23 @@ The first version of the POC exposed several correctness problems. They were fix
 | Every materialization rescanned and re-ranked the whole history | `ops.materialization_state` limits each run to the keys with new arrivals; replay remains a full rebuild. |
 | Polaris `catalog_admin` does not include data-write, and drop-with-purge is off by default, so only the first replay could drop its target | `polaris-setup` grants `CATALOG_MANAGE_CONTENT` and sets `polaris.config.drop-with-purge.enabled=true` on the catalog, so drops with purge work on every run. |
 | Reconciliation only compared key counts | It now compares business columns, tombstone state, operation, and source position, and a full replay must match the live projection exactly. |
+| An idle run still rewrote `silver` | `orders_current` checks for raw rows newer than the watermark and skips the `MERGE`; the SQL keeps `>=` so a re-run never loses a boundary event. |
 
 ## 🚀 Quick start
 
-From Windows PowerShell, copy `.env.example` to `.env` and set the local PostgreSQL, MinIO, and Polaris passwords. Start the services and prepare the CDC source:
+From Windows PowerShell, copy `.env.example` to `.env`, set the local PostgreSQL, MinIO, and Polaris passwords, and point `PCL_HOST_WORKSPACE` and `PCL_PODMAN_SOCKET` at this machine (Dagster starts Spark and Beam through the host engine). Start the services and prepare the CDC source:
 
 ```powershell
 Copy-Item .env.example .env
-bundle exec rake infra:up          # starts Postgres, Kafka, MinIO, Polaris, Connect, Trino
+bundle exec rake infra:up          # starts the stack and the Dagster daemon
 bundle exec rake lakehouse:init    # Spark creates the raw/silver/ops Iceberg tables
 bundle exec rake debezium:register # registers the PostgreSQL connector
 bundle exec rake fixtures:scenarios
 ```
 
-`infra:up` starts PostgreSQL first, ensures the `polaris` database and `polaris_schema` exist, then starts the rest of the stack. The one-shot `polaris-setup` container creates the `pcl` catalog idempotently. Polaris listens on `http://localhost:8181/api/catalog`; its health endpoint is `http://localhost:8182/q/health`. The first `lakehouse:init` builds the pinned Spark image locally; later runs reuse it.
+`infra:up` starts PostgreSQL first, ensures the `polaris` and `dagster` databases and `polaris_schema` exist, then starts the rest of the stack and finally the Dagster daemon. The one-shot `polaris-setup` container creates the `pcl` catalog idempotently. Polaris listens on `http://localhost:8181/api/catalog`; its health endpoint is `http://localhost:8182/q/health`. The first `lakehouse:init` builds the pinned Spark image locally; later runs reuse it.
+
+The Dagster schedule is already running and performs the same initialization and incremental steps every five minutes, so the explicit commands above only make the first result immediate. The UI is at [localhost:3000](http://localhost:3000): `rake dagster:run` triggers the same job on demand, and `rake dagster:replay[readme_proof]` runs a replay through Dagster.
 
 Launch the unbounded Beam job. It keeps reading CDC events from Kafka and writing them to Iceberg until you stop the Flink cluster:
 
@@ -238,9 +260,9 @@ $env:PCL_MAX_RECORDS = '0'
 bundle exec rake pipeline:flink
 ```
 
-This command stays attached while the job runs. Open the Flink dashboard at [localhost:8081](http://localhost:8081). To stop the job from a second PowerShell window, run `bundle exec rake pipeline:flink:stop`.
+This command stays attached while the job runs. Open the Flink dashboard at [localhost:8081](http://localhost:8081). To stop the job from a second PowerShell window, run `bundle exec rake pipeline:flink:stop`. The continuous job and Dagster share the `pcl-pg-local-1` consumer group, so run one at a time: stop the scheduler with `bundle exec rake dagster:down` before starting the unbounded job.
 
-The `silver.orders_current` projection is refreshed separately with Spark; in a second window, run `bundle exec rake lakehouse:materialize` when you want to update it, then inspect it with `bundle exec rake query:file[sql/trino/reconciliation.sql]`.
+The `silver.orders_current` projection is refreshed by Dagster every five minutes. `bundle exec rake lakehouse:materialize` runs the same Spark script by hand when you want the update immediately; `bundle exec rake query:file[sql/trino/reconciliation.sql]` then inspects the result.
 
 ## 📸 Results from the running POC
 
@@ -260,6 +282,7 @@ All services ready.
   MinIO    http://localhost:9001
   Polaris  http://localhost:8181/api/catalog
   Polaris health  http://localhost:8182/q/health
+  Dagster  http://localhost:3000
 ```
 
 ```text
@@ -294,7 +317,7 @@ The bounded DirectRunner pass read 15 Kafka records, accepted 13, and counted 2 
 elements_read=15  accepted_events=13  kafka_tombstones=2  dataFilesWritten=1
 ```
 
-The FlinkRunner job started from the earliest offset because no consumer offsets were committed, so it appended a second batch of 13 accepted events. A third bounded pass, used for the dead-letter check below, appended the same 13 events once more. The audit table now holds 39 rows for 13 distinct event ids, which is the at-least-once behavior the projection is designed to absorb.
+The FlinkRunner job started from the earliest offset because no consumer offsets were committed, so it appended a second batch of 13 accepted events. A third bounded pass, used for the dead-letter check below, appended the same 13 events once more. The two scheduled Dagster runs described in section 6 then appended one event each, so the audit table now holds 41 rows for 15 distinct event ids, which is the at-least-once behavior the projection is designed to absorb.
 
 In this session the runner passes were bounded to 15 records (19 for the dead-letter check below). The screenshots below come from the earlier continuous run of the same job, which stayed up long enough to accumulate checkpoints:
 
@@ -353,16 +376,19 @@ ops | materialization_state
 raw | order_cdc_events
 silver | orders_current
 silver | orders_current_replay_readme_proof
+silver | orders_current_replay_window_probe
 
 == current-state snapshots
+4709231253593627168 | overwrite | 2026-10-27 21:53:30.220 UTC
+8028985869781163391 | overwrite | 2026-10-27 21:44:26.723 UTC
 4705716679392310919 | overwrite | 2026-10-27 20:15:40.567 UTC
 1414936190202702993 | overwrite | 2026-10-27 19:58:06.729 UTC
 1580568179560580880 | overwrite | 2026-10-27 19:47:57.356 UTC
-319887680504692394  | overwrite | 2026-10-27 19:45:20.538 UTC
-6413925175051381393 | append    | 2026-10-27 19:36:03.249 UTC
+319887680504692394 | overwrite | 2026-10-27 19:45:20.538 UTC
+6413925175051381393 | append | 2026-10-27 19:36:03.249 UTC
 
 == materialization watermark
-silver.orders_current | 2026-10-27 20:13:11.514 UTC | 2026-10-27 20:15:40.854 UTC
+silver.orders_current | 2026-10-27 21:50:53.055 UTC | 2026-10-27 21:53:31.171 UTC
 ```
 
 Trino cannot write, and it is the engine that enforces it:
@@ -394,8 +420,8 @@ true  | 1
 13 | 26
 
 -- 5. Discrepancy report.
-1001 | 31464144 | 31464144 | UPDATE | UPDATE | false | false | ok
-1002 | 31464704 | 31464704 | UPDATE | UPDATE | false | false | ok
+1001 | 39108792 | 39108792 | UPDATE | UPDATE | false | false | ok
+1002 | 41398768 | 41398768 | UPDATE | UPDATE | false | false | ok
 1003 | 31464104 | 31464104 | SNAPSHOT_READ | SNAPSHOT_READ | false | false | ok
 1004 | 31464816 | 31464816 | DELETE | DELETE | true | true | ok
 1005 | 31464960 | 31464960 | CREATE | CREATE | false | false | ok
@@ -467,7 +493,59 @@ MISSING_PRIMARY_KEY  | - | {"op":"u","after":{"status":"NO_KEY"},"source":{"db"
 
 `event_id` is empty on purpose: the envelope never reached identity derivation, so there is no canonical id to attach. The payload and the Kafka reference are what make the record diagnosable, and none of the four reached `raw` or `silver`.
 
-### 6. Terminal evidence
+### 6. Dagster runs the pipeline unattended
+
+The schedule is created in `RUNNING` state, so `rake infra:up` starts orchestrating without a manual trigger:
+
+```text
+$ podman exec pcl-dagster-daemon dagster schedule list -w /opt/dagster/app/workspace.yaml
+Repository __repository__
+*************************
+Schedule: pcl_incremental_every_five_minutes [RUNNING]
+Cron Schedule: */5 * * * *
+```
+
+An `UPDATE` was applied to PostgreSQL at 21:47 UTC and nothing was triggered by hand. The 21:50 tick measured a lag of one record, read it, committed offset 21, and merged the keys that had arrived since the watermark:
+
+```text
+... raw_cdc_events - Reading 1 pending records from pcl.public.orders.
+... raw_cdc_events - Committed offsets {0: 21}.
+... orders_current_projection_matches_history - Asset check 'projection_matches_history' on 'orders_current' passed. Description: '0 keys disagree with the history.'
+... RUN_SUCCESS - Finished execution of run for "pcl_incremental".
+```
+
+The metadata the run recorded:
+
+| Asset | Metadata | Value |
+|---|---|---|
+| `raw_cdc_events` | pending / read / accepted | 1 / 1 / 1 |
+| `raw_cdc_events` | rejected / data files written | 0 / 1 |
+| `orders_current` | pending raw events | 1 |
+| `orders_current` | changed / projected keys | 2 / 2 |
+| `orders_current` | watermark | `2026-10-27 21:50:53.054 UTC` |
+| `orders_current` | projection keys (live / tombstone) | 7 (6 / 1) |
+
+Two keys were re-ranked, not one: the order that changed and the key sitting exactly on the previous watermark, which the `>=` detection window re-checks on purpose. The run took 3 minutes 55 seconds, mostly the two JVM containers.
+
+The next tick, at 21:55, found nothing new and skipped both external jobs:
+
+```text
+... raw_cdc_events - No pending records for pcl.public.orders.
+... orders_current - No raw events since the watermark; skipping the MERGE.
+... RUN_SUCCESS - Finished execution of run for "pcl_incremental".
+```
+
+![Dagster run launched by the schedule, with four assets and two checks](docs/screenshots/02-dagster-runs.png)
+
+Replay is not scheduled. `rake dagster:replay` runs the same Spark script through the same container, with an optional inclusive LSN window:
+
+```text
+$ rake "dagster:replay[readme_proof]"
+... orders_current_replay - Full replay readme_proof matches silver.orders_current exactly.
+... RUN_SUCCESS - Finished execution of run for "pcl_replay".
+```
+
+### 7. Terminal evidence
 
 A single capture of the commands behind the state above, from `infra:up` to the read-only rejection:
 
@@ -481,8 +559,9 @@ A single capture of the commands behind the state above, from `infra:up` to the 
 - Reconciliation compares business columns, tombstone state, operation, and source position, not only key counts. A full replay must match the live projection exactly, and a bounded replay contains only the keys inside its LSN window.
 - Raw history is append-only. Repeated delivery is expected under at-least-once processing and is handled by deduplicating on `event_id`; the duplicate report makes it visible.
 - Invalid envelopes never reach `raw` or `silver`: they land in `ops.cdc_dead_letter` with a stable reason code, the original payload, and the run that saw them, and the pipeline keeps going.
+- Dagster runs the graph unattended: a scheduled tick measured the Kafka lag, started a bounded Beam read, committed the offsets after the append, ran the Spark `MERGE`, and both asset checks passed. An idle tick skipped Beam and Spark instead of rewriting `silver`.
 
-This is a **proof of concept**, not a production-ready platform. Restart/recovery behavior is exercised at the checkpoint-configuration level, not through a sustained failure-injection campaign. Performance benchmarking, schema evolution, and a second source table remain unvalidated. Exactly-once processing and production throughput are not claimed.
+This is a **proof of concept**, not a production-ready platform. Restart/recovery behavior is exercised at the checkpoint-configuration level, not through a sustained failure-injection campaign. The scheduler is a single cron job with two asset checks: it has no retry policy, backfill UI, or alerting, and its daemon is one process, so scheduled runs have a single point of failure. Performance benchmarking, schema evolution, and a second source table remain unvalidated. Exactly-once processing and production throughput are not claimed.
 
 ## 📜 License
 
