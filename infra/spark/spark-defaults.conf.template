@@ -1,0 +1,25 @@
+# Rendered from .env by Rake into .local/spark/spark-defaults.conf.
+spark.sql.catalog.pcl=org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.pcl.type=rest
+spark.sql.catalog.pcl.uri=http://polaris:8181/api/catalog
+spark.sql.catalog.pcl.warehouse=__PCL_ICEBERG_WAREHOUSE__
+spark.sql.catalog.pcl.rest.auth.type=oauth2
+spark.sql.catalog.pcl.credential=__PCL_POLARIS_CLIENT_ID__:__PCL_POLARIS_CLIENT_SECRET__
+spark.sql.catalog.pcl.oauth2-server-uri=http://polaris:8181/api/catalog/v1/oauth/tokens
+spark.sql.catalog.pcl.scope=PRINCIPAL_ROLE:ALL
+spark.sql.catalog.pcl.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+spark.sql.catalog.pcl.s3.endpoint=http://minio:9000
+spark.sql.catalog.pcl.s3.path-style-access=true
+spark.sql.catalog.pcl.s3.region=__PCL_MINIO_REGION__
+spark.sql.catalog.pcl.s3.access-key-id=__PCL_MINIO_ROOT_USER__
+spark.sql.catalog.pcl.s3.secret-access-key=__PCL_MINIO_ROOT_PASSWORD__
+spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+
+spark.sql.defaultCatalog=pcl
+spark.sql.session.timeZone=UTC
+# CDC images are string maps: a malformed value must cast to NULL, not abort the run.
+spark.sql.ansi.enabled=false
+spark.sql.warehouse.dir=file:/tmp/spark-warehouse
+spark.driver.memory=__PCL_SPARK_DRIVER_MEMORY__
+spark.ui.enabled=false
+spark.sql.shuffle.partitions=4

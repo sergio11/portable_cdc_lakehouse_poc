@@ -10,7 +10,7 @@
 #     would force an advertised-listener split between host and container
 #     clients, which is a classic source of silent misconfiguration.
 #   * MinIO provides S3-compatible object storage for the Iceberg warehouse.
-#     Beam and Trino use the same endpoint, bucket and credentials.
+#     Beam, Spark and Trino use the same endpoint, bucket and credentials.
 #   * Postgres runs with logical WAL decoding enabled for Debezium.
 #
 # Usage is always through Rake (`rake infra:up`), never by calling
@@ -221,6 +221,10 @@ services:
     volumes:
       # Generated from the local .env; contains credentials and is gitignored.
       - ./.local/trino/catalog:/etc/trino/catalog:ro
+      # Trino is the serving layer only. The built-in read-only access control
+      # rejects INSERT, CREATE, MERGE, DROP and ALTER even if a query reaches it,
+      # so the layer boundary is enforced by the engine, not just by Rake.
+      - ./infra/trino/etc/access-control.properties:/etc/trino/access-control.properties:ro
       - trino_data:/var/lib/trino/data
     ports:
       - "127.0.0.1:${PCL_TRINO_PORT}:8080"
@@ -232,6 +236,27 @@ services:
       timeout: 10s
       retries: 12
       start_period: 120s
+
+  # Apache Spark is the batch transformation layer: it owns the Iceberg DDL, the
+  # incremental MERGE into silver, and the replay rebuild. Trino never writes.
+  #
+  # This is a one-shot CLI image, not a long-running service: Rake starts
+  # `spark-sql`, runs a script against Polaris and exits. The `tools` profile
+  # keeps it out of `rake infra:up`; the service exists so the image is built
+  # from Compose with the same pinned versions as the rest of the stack.
+  spark:
+    image: localhost/pcl-spark:${PCL_SPARK_VERSION:-3.5.9}-iceberg-${PCL_SPARK_ICEBERG_VERSION:-1.11.0}
+    build:
+      context: ./infra/spark
+      args:
+        SPARK_VERSION: ${PCL_SPARK_VERSION:-3.5.9}
+        ICEBERG_VERSION: ${PCL_SPARK_ICEBERG_VERSION:-1.11.0}
+    volumes:
+      - ./sql:/opt/pcl/sql:ro
+      - ./.local/spark:/opt/pcl/conf:ro
+    working_dir: /tmp
+    restart: "no"
+    profiles: ["tools"]
 
   flink-jobmanager:
     image: docker.io/library/flink:2.2.1-java21

@@ -66,17 +66,17 @@ module Debezium
 end
 
 namespace :lakehouse do
-  desc "Create the Iceberg schemas and tables (raw / silver / ops)"
+  SPARK_SQL_DIR = File.join(Config::ROOT, "sql", "spark")
+
+  desc "Create the Iceberg schemas and tables (raw / silver / ops) with Spark"
   task :init do
     env = Config.load_env!
     Infra.ensure_iceberg_bucket!(env)
-    path = File.join(Config::ROOT, "sql", "bootstrap_catalog.sql")
-    result = Trino.execute_file(path, env)
-
-    puts "Iceberg tables ready (query #{result['query_id']})."
+    Spark.run_file(File.join(SPARK_SQL_DIR, "bootstrap_catalog.sql"), env)
+    puts "Iceberg tables ready (spark-sql, catalog pcl)."
   end
 
-  desc "Describe the Iceberg tables and their snapshots"
+  desc "Describe the Iceberg tables, snapshots, and incremental watermark"
   task :describe do
     env = Config.load_env!
 
@@ -89,10 +89,12 @@ namespace :lakehouse do
         SELECT snapshot_id, operation, committed_at
           FROM "silver"."orders_current$snapshots" ORDER BY committed_at DESC
       SQL
+      "materialization watermark" => <<~SQL
+        SELECT target_table, last_ingested_at, updated_at
+          FROM ops.materialization_state ORDER BY target_table
+      SQL
     }
 
-    # Each probe is independent: a table that has not been materialised yet must
-    # not hide the rest of the report.
     statements.each do |label, sql|
       puts "\n== #{label}"
       begin
@@ -103,16 +105,16 @@ namespace :lakehouse do
     end
   end
 
-  desc "Materialize the latest raw CDC event per key into silver.orders_current"
+  desc "Incrementally merge new raw CDC events into silver.orders_current with Spark"
   task :materialize do
     env = Config.load_env!
     Infra.ensure_iceberg_bucket!(env)
-    path = File.join(Config::ROOT, "sql", "materialize_orders.sql")
-    sql = File.read(path)
-      .gsub("__TARGET_TABLE__", "iceberg.silver.orders_current")
-      .gsub("__RAW_FILTER__", "TRUE")
-    result = Trino.execute(sql.sub(/;\s*\z/, ""), env)
-    puts "Current-state projection refreshed (query #{result['query_id']})."
+    sql = Spark.expand_template(
+      File.join(SPARK_SQL_DIR, "materialize_orders.sql"),
+      target: "pcl.silver.orders_current"
+    )
+    Spark.run_sql(sql, name: "materialize_orders", env: env)
+    puts "Current-state projection refreshed (spark-sql, catalog pcl)."
   end
 
   desc "Replay raw CDC history into an isolated table: PCL_REPLAY_ID=run1 [PCL_REPLAY_FROM_LSN=..] [PCL_REPLAY_TO_LSN=..]"
@@ -128,40 +130,32 @@ namespace :lakehouse do
     end
     abort("PCL_REPLAY_FROM_LSN must not exceed PCL_REPLAY_TO_LSN.") if from_lsn && to_lsn && from_lsn.to_i > to_lsn.to_i
 
-    target = "iceberg.silver.orders_current_replay_#{replay_id}"
+    target = "pcl.silver.orders_current_replay_#{replay_id}"
+    trino_target = "iceberg.silver.orders_current_replay_#{replay_id}"
     Infra.ensure_iceberg_bucket!(env)
-
-    # Replay must be a clean rebuild: re-running the same id must not inherit
-    # rows from a previous, possibly different, window. The source schema is
-    # taken from the live projection, so `lakehouse:init` must have run.
-    Trino.execute_file(File.join(Config::ROOT, "sql", "bootstrap_catalog.sql"), env)
-    Trino.execute("DROP TABLE IF EXISTS #{target}", env)
-    Trino.execute(
-      "CREATE TABLE #{target} WITH (format_version = 2) " \
-      "AS SELECT * FROM iceberg.silver.orders_current WHERE false",
-      env
-    )
 
     filter = [
       from_lsn && "lsn >= #{from_lsn}",
       to_lsn && "lsn <= #{to_lsn}"
     ].compact.join(" AND ")
     filter = "TRUE" if filter.empty?
-    template = File.read(File.join(Config::ROOT, "sql", "materialize_orders.sql"))
-    sql = template.gsub("__TARGET_TABLE__", target).gsub("__RAW_FILTER__", filter)
-    result = Trino.execute(sql.sub(/;\s*\z/, ""), env)
-    summary = Trino.execute("SELECT count(*), count_if(is_deleted) FROM #{target}", env)["data"].flatten
-    puts "Replay #{replay_id} materialized to #{target}: #{summary[0]} keys, #{summary[1]} tombstones (query #{result['query_id']})."
 
-    # A full replay (no window) must reproduce the live projection exactly on
-    # the business columns and the source position. A bounded replay is a
-    # partial history by construction, so only report its shape.
+    sql = Spark.expand_template(
+      File.join(SPARK_SQL_DIR, "replay_orders.sql"),
+      target: target,
+      raw_filter: filter
+    )
+    Spark.run_sql(sql, name: "replay_#{replay_id}", env: env)
+
+    summary = Trino.execute("SELECT count(*), count_if(is_deleted) FROM #{trino_target}", env)["data"].flatten
+    puts "Replay #{replay_id} materialized to #{target}: #{summary[0]} keys, #{summary[1]} tombstones."
+
     if from_lsn.nil? && to_lsn.nil?
       mismatches = Trino.execute(<<~SQL, env)["data"].flatten.first
         SELECT count(*)
           FROM (
             SELECT coalesce(r.order_id, c.order_id) AS order_id
-              FROM #{target} r
+              FROM #{trino_target} r
               FULL OUTER JOIN iceberg.silver.orders_current c
                 ON r.order_id = c.order_id
              WHERE r.order_id IS NULL
@@ -194,14 +188,15 @@ namespace :debezium do
 end
 
 namespace :query do
-  desc "Run a SQL file against Trino: rake query:file[sql/reconciliation.sql]"
+  desc "Run a read-only SQL file against Trino: rake query:file[sql/trino/reconciliation.sql]"
   task :file, [:path] do |_t, args|
     env = Config.load_env!
-    relative = args[:path] or abort("Provide a SQL file: rake query:file[sql/reconciliation.sql]")
+    relative = args[:path] or abort("Provide a SQL file: rake query:file[sql/trino/reconciliation.sql]")
     full = File.join(Config::ROOT, relative)
     abort("SQL file not found: #{relative}") unless File.exist?(full)
 
     statements = Trino.split_statements(File.read(full))
+    Trino.assert_read_only!(statements)
     query_id = nil
 
     # One block per statement, labelled with its leading comment. Printing the

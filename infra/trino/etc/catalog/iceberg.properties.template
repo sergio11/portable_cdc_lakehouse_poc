@@ -20,7 +20,3 @@ s3.region=__PCL_MINIO_REGION__
 s3.path-style-access=true
 s3.aws-access-key=__PCL_MINIO_ROOT_USER__
 s3.aws-secret-key=__PCL_MINIO_ROOT_PASSWORD__
-
-iceberg.file-format=PARQUET
-iceberg.compression-codec=ZSTD
-iceberg.register-table-procedure.enabled=true

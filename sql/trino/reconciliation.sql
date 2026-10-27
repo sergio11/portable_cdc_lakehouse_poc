@@ -1,7 +1,10 @@
 -- ---------------------------------------------------------------------------
 -- Reconciliation queries.
 --
--- Run with:  rake query:file[sql/reconciliation.sql]
+-- Run with:  rake query:file[sql/trino/reconciliation.sql]
+--
+-- Trino is read-only here: this file only reads the append-only history and the
+-- projection. Transformation lives in Spark (rake lakehouse:*).
 --
 -- Everything here is derived from raw.order_cdc_events, so the append-only
 -- history is the audit trail and the projection is the thing under test.

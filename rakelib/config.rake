@@ -41,6 +41,18 @@ module Config
   TRINO_CATALOG_OUTPUT = File.join(ROOT, ".local", "trino", "catalog", "iceberg.properties")
   PIPELINE_ENV_OUTPUT = File.join(ROOT, ".local", "pipeline.env")
 
+  # --- Spark (batch transformation layer) ------------------------------------
+  # Spark is a one-shot CLI image, not a long-running service. The Iceberg
+  # runtime must match the base image line (Spark 3.5 / Scala 2.12). Versions are
+  # mirrored in compose.yaml so the image tag built by Compose is the same one
+  # Rake runs.
+  SPARK_DEFAULT_VERSION = "3.5.9"
+  SPARK_DEFAULT_ICEBERG_VERSION = "1.11.0"
+  SPARK_DEFAULT_DRIVER_MEMORY = "1g"
+  SPARK_CONF_TEMPLATE = File.join(ROOT, "infra", "spark", "spark-defaults.conf.template")
+  SPARK_CONF_OUTPUT = File.join(ROOT, ".local", "spark", "spark-defaults.conf")
+  SPARK_WORK_DIR = File.join(ROOT, ".local", "spark", "work")
+
   ENV_FILE = File.join(ROOT, ".env")
 
   # Parse the local .env into a Hash. Credentials stay on disk, never in Git.
@@ -120,6 +132,34 @@ module Config
       settings.each { |key, value| file.puts("#{key}=#{value}") }
     end
     PIPELINE_ENV_OUTPUT
+  end
+
+  # Image tag built by Compose (`build: ./infra/spark`) and run by Rake. Keeping
+  # the tag in one method prevents "built one image, ran another" drift.
+  def self.spark_image(env = load_env!)
+    version = env.fetch("PCL_SPARK_VERSION", SPARK_DEFAULT_VERSION)
+    iceberg = env.fetch("PCL_SPARK_ICEBERG_VERSION", SPARK_DEFAULT_ICEBERG_VERSION)
+    "localhost/pcl-spark:#{version}-iceberg-#{iceberg}"
+  end
+
+  # Render the Iceberg catalog and S3 settings for the Spark session. The output
+  # holds credentials and lives under the gitignored .local/ directory.
+  def self.render_spark_conf!(env = load_env!)
+    template = File.read(SPARK_CONF_TEMPLATE)
+    replacements = {
+      "PCL_ICEBERG_WAREHOUSE" => env.fetch("PCL_ICEBERG_WAREHOUSE", "pcl"),
+      "PCL_POLARIS_CLIENT_ID" => env.fetch("PCL_POLARIS_CLIENT_ID", "root"),
+      "PCL_POLARIS_CLIENT_SECRET" => env.fetch("PCL_POLARIS_CLIENT_SECRET"),
+      "PCL_MINIO_REGION" => env.fetch("PCL_MINIO_REGION"),
+      "PCL_MINIO_ROOT_USER" => env.fetch("PCL_MINIO_ROOT_USER"),
+      "PCL_MINIO_ROOT_PASSWORD" => env.fetch("PCL_MINIO_ROOT_PASSWORD"),
+      "PCL_SPARK_DRIVER_MEMORY" => env.fetch("PCL_SPARK_DRIVER_MEMORY", SPARK_DEFAULT_DRIVER_MEMORY)
+    }
+    replacements.each { |key, value| template = template.gsub("__#{key}__", value) }
+
+    FileUtils.mkdir_p(SPARK_WORK_DIR)
+    File.open(SPARK_CONF_OUTPUT, "w", 0o600) { |file| file.write(template) }
+    SPARK_CONF_OUTPUT
   end
 end
 

@@ -1,8 +1,8 @@
 #!/bin/sh
 # Create the `pcl` catalog in Apache Polaris if it does not exist yet.
 #
-# Polaris stores only metadata. Data files live in MinIO and both Beam and Trino
-# keep their own S3 credentials, so `stsUnavailable=true` is correct here:
+# Polaris stores only metadata. Data files live in MinIO and Beam, Spark and
+# Trino keep their own S3 credentials, so `stsUnavailable=true` is correct here:
 # MinIO does not implement STS and credential vending is not needed.
 #
 # Deliberately dependency-free: the container ships only curl and a POSIX shell.
@@ -118,7 +118,7 @@ else
   echo "Granted CATALOG_MANAGE_CONTENT to Polaris catalog role 'catalog_admin'."
 fi
 
-# Trino drops tables with purge, but Polaris rejects the purge unless the
+# Replay drops tables with purge, but Polaris rejects the purge unless the
 # feature is enabled on the catalog. The setting lives in catalog properties so
 # it is scoped to this POC instead of the whole server. An existing catalog is
 # updated in place, which keeps the bootstrap idempotent.

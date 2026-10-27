@@ -60,11 +60,6 @@ namespace :test do
   task :unit do
     Build.container_sbt(Build.sbt_test_only(*Build::UNIT_TEST_PATTERNS))
   end
-
-  desc "Run integration tests (requires `rake infra:up`)"
-  task :integration do
-    Build.container_sbt(Build.sbt_test_only("com.example.pcl.integration.*"))
-  end
 end
 
 # NOTE: Rake automatically imports every `rakelib/*.rake` file, which is where

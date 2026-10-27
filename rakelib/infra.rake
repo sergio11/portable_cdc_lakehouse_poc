@@ -221,10 +221,12 @@ end
 
 # --- Trino client ------------------------------------------------------------
 #
-# Trino speaks a simple statement protocol over HTTP. Talking to it directly
-# keeps the query layer dependency-free: no Trino CLI image, no JDBC driver, no
-# gems, and the same code path from Windows, Linux and macOS.
+# Trino is the serving layer. This client only reads: the engine's read-only
+# access control is the real boundary, and the keyword allowlist below fails
+# fast with a clearer message.
 module Trino
+  READ_ONLY_KEYWORDS = %w[SELECT WITH SHOW DESCRIBE DESC EXPLAIN VALUES TABLE].freeze
+
   module_function
 
   def execute(sql, env = Config.load_env!)
@@ -287,6 +289,26 @@ module Trino
     end
 
     { "query_id" => query_id, "data" => results }
+  end
+
+  # First SQL keyword, ignoring leading line and block comments.
+  def first_keyword(statement)
+    stripped = statement.gsub(%r{/\*.*?\*/}m, " ")
+    stripped = stripped.lines.reject { |line| line.strip.start_with?("--") }.join
+    stripped.strip.split(/\s+/, 2).first.to_s.upcase
+  end
+
+  def assert_read_only!(statements)
+    statements.each do |statement|
+      keyword = first_keyword(statement)
+      next if READ_ONLY_KEYWORDS.include?(keyword)
+
+      abort(<<~MSG)
+        query:file is read-only and cannot run #{keyword.empty? ? 'an empty statement' : keyword}.
+        Allowed: #{READ_ONLY_KEYWORDS.join(', ')}.
+        Writes belong to Spark: rake lakehouse:init, lakehouse:materialize, lakehouse:replay.
+      MSG
+    end
   end
 
   # Human-readable label for a statement: the numbered section heading of its
@@ -380,6 +402,72 @@ module Trino
   end
 end
 
+# --- Spark batch transformation client ---------------------------------------
+#
+# Spark owns DDL, the incremental MERGE and replay. It runs as a one-shot
+# `spark-sql` container on the Compose network; there is no long-lived cluster.
+module Spark
+  SQL_MOUNT = "/opt/pcl/sql"
+  CONF_MOUNT = "/opt/pcl/conf"
+  CONF_DIR = File.join(Config::ROOT, ".local", "spark")
+
+  module_function
+
+  def image(env = Config.load_env!)
+    Config.spark_image(env)
+  end
+
+  def image_present?(env = Config.load_env!)
+    _out, _err, status = Open3.capture3("podman", "image", "exists", image(env))
+    status.success?
+  end
+
+  def ensure_image!(env = Config.load_env!)
+    return if image_present?(env)
+
+    puts "Building #{image(env)}..."
+    Infra.compose("--profile", "tools", "build", "spark")
+    abort("Spark image #{image(env)} is missing after the build.") unless image_present?(env)
+  end
+
+  def run_file(path, env = Config.load_env!)
+    run_sql(File.read(path), name: File.basename(path, ".sql"), env: env)
+  end
+
+  # The rendered script is kept under .local/ so the exact SQL that ran is
+  # available for debugging.
+  def run_sql(sql, name:, env: Config.load_env!)
+    ensure_image!(env)
+    Config.render_spark_conf!(env)
+    FileUtils.mkdir_p(Config::SPARK_WORK_DIR)
+    File.write(File.join(Config::SPARK_WORK_DIR, "#{name}.sql"), sql)
+
+    run!(
+      "podman", "run", "--rm", "--network", "pcl_default",
+      "-v", "#{File.join(Config::ROOT, 'sql')}:#{SQL_MOUNT}:ro",
+      "-v", "#{CONF_DIR}:#{CONF_MOUNT}:ro",
+      "-w", "/tmp",
+      image(env),
+      "/opt/spark/bin/spark-sql",
+      "--properties-file", "#{CONF_MOUNT}/spark-defaults.conf",
+      "--driver-memory", env.fetch("PCL_SPARK_DRIVER_MEMORY", Config::SPARK_DEFAULT_DRIVER_MEMORY),
+      "-f", "#{CONF_MOUNT}/work/#{name}.sql"
+    )
+  end
+
+  # Splice the shared ranking and MERGE into a top-level script.
+  def expand_template(path, target:, raw_filter: nil)
+    projection = File.read(File.join(Config::ROOT, "sql", "spark", "projection_source.sql"))
+    merge = File.read(File.join(Config::ROOT, "sql", "spark", "merge_orders.sql"))
+
+    sql = File.read(path)
+      .gsub("-- __PROJECTION_SOURCE__") { projection }
+      .gsub("-- __MERGE__") { merge }
+      .gsub("__TARGET_TABLE__") { target }
+    raw_filter ? sql.gsub("__RAW_FILTER__") { raw_filter } : sql
+  end
+end
+
 # --- Task definitions --------------------------------------------------------
 
 namespace :infra do
@@ -417,7 +505,7 @@ namespace :infra do
   desc "Stop the stack, keeping volumes (the CDC history is preserved)"
   task :down do
     Config.load_env!
-    Infra.compose("down")
+    Infra.compose("--profile", "flink", "down")
   end
 
   desc "Show container status"
@@ -446,7 +534,7 @@ namespace :infra do
     end
 
     Config.load_env!
-    Infra.compose("down", "-v")
+    Infra.compose("--profile", "flink", "down", "-v")
     puts "Volumes removed. `rake infra:up` rebuilds an empty environment."
   end
 end
