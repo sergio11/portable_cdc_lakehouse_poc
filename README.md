@@ -296,7 +296,7 @@ elements_read=15  accepted_events=13  kafka_tombstones=2  dataFilesWritten=1
 
 The FlinkRunner job started from the earliest offset because no consumer offsets were committed, so it appended a second batch of 13 accepted events. A third bounded pass, used for the dead-letter check below, appended the same 13 events once more. The audit table now holds 39 rows for 13 distinct event ids, which is the at-least-once behavior the projection is designed to absorb.
 
-In this session both passes were bounded to 15 records. The screenshots below come from the earlier continuous run of the same job, which stayed up long enough to accumulate checkpoints:
+In this session the runner passes were bounded to 15 records (19 for the dead-letter check below). The screenshots below come from the earlier continuous run of the same job, which stayed up long enough to accumulate checkpoints:
 
 ![Beam job running on the Flink dashboard](docs/screenshots/03-flink-job-running.png)
 
@@ -435,7 +435,16 @@ Orders 1006 and 1007 are absent because their events fall outside the window. A 
 
 ### 5. Invalid envelopes are quarantined, not dropped
 
-Four deliberately invalid envelopes were published to the same Kafka topic: truncated JSON, an unknown `op`, a delete with no row image, and an update with no primary key. The next bounded pass read 19 records, accepted 13, and rejected 4:
+Four deliberately invalid envelopes were published to the same Kafka topic: truncated JSON, an unknown `op`, a delete with no row image, and an update with no primary key. `infra/fixtures/invalid_envelopes.jsonl` holds them, so the check is reproducible:
+
+```powershell
+Get-Content infra/fixtures/invalid_envelopes.jsonl |
+  podman exec -i pcl-kafka /opt/kafka/bin/kafka-console-producer.sh `
+    --bootstrap-server localhost:9092 --topic pcl.public.orders
+$env:PCL_MAX_RECORDS = '25'; bundle exec rake pipeline:direct
+```
+
+The bounded pass read 19 records, accepted 13, and rejected 4:
 
 ```text
 elements_read=19  accepted_events=13  rejected_events=4  kafka_tombstones=2  dataFilesWritten=1
