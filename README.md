@@ -14,6 +14,24 @@ This repository is an open-source engineering experiment intended for learning a
 
 The goal is to make the path from a relational database change to an auditable lakehouse table visible and reproducible. The POC focuses on the boundaries that are easy to get wrong in streaming systems: CDC envelope normalization, source-position ordering, duplicate delivery, delete tombstones, replay, and the interaction between Beam runners and Iceberg storage.
 
+## ⚖️ Why this architecture
+
+PostgreSQL answers *what is the state now*. This POC also answers *how did it get here, and can I rebuild it*.
+
+| Question | Querying PostgreSQL directly | This POC |
+|---|---|---|
+| What is the current state? | Yes, simple and fast | Yes, in `silver` |
+| What changed, and when? | No, only the live row | Yes, append-only `raw` with before/after images |
+| What happened to deleted rows? | No, they are gone | Yes, versioned tombstones |
+| Can I reprocess after a rule or bug fix? | No, the changes are lost | Yes, rebuild `silver` from `raw` |
+| Can analytics run without loading the operational database? | No, they compete with the application | Yes, Trino and Iceberg |
+| Can several consumers read the same stream? | No, they couple to the database | Yes, one Kafka stream, many readers |
+| Can I read the table as of a past snapshot? | No | Yes, Iceberg snapshots |
+
+The point is not to read better: it is to **reconstruct, audit, and analyze without touching the operational system**.
+
+The trade-off is explicit: more moving parts (Kafka, Flink, Iceberg, Polaris, Trino), seconds of latency, and duplicated storage. For a small dataset that only needs the current row, a direct `SELECT` is the better engineering choice.
+
 ## ✨ Key highlights
 
 - 🐘 Capture PostgreSQL changes from the WAL with Debezium.
