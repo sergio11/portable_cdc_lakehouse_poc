@@ -1,0 +1,12 @@
+# Pinned orchestration runtime. Dagster runs the same steps Rake runs, so the
+# versions here only need to agree with the Dagster service in compose.yaml.
+# Core libraries are 1.x; integration libraries keep their own 0.x line.
+dagster==1.13.27
+dagster-webserver==1.13.27
+dagster-postgres==0.29.27
+confluent-kafka==2.16.0
+requests==2.32.5
+# SQLAlchemy 2.1 resolves bare postgresql:// URLs to the psycopg 3 driver, which
+# dagster-postgres does not install. Stay on the 2.0 line so the declared
+# psycopg2 dependency is the one that gets used.
+SQLAlchemy==2.0.55

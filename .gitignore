@@ -13,6 +13,10 @@ project/project/
 vendor/bundle/
 .bundle/
 
+# --- Python (Dagster) ---
+__pycache__/
+*.pyc
+
 # --- Local env & secrets ---
 .env
 .env.*

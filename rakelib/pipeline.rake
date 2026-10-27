@@ -24,7 +24,7 @@ namespace :pipeline do
       "-v", "#{Config::BUILD_VOLUME}-target:/workspace/target:ro",
       "-w", "/workspace",
       "--entrypoint", "java",
-      Config::SBT_IMAGE,
+      Config.sbt_image(env),
       "-jar", "/workspace/target/scala-2.13/pcl-pipeline.jar",
       *runner_args,
       *ENV.fetch("PCL_BEAM_ARGS", "").split

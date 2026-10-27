@@ -9,7 +9,9 @@ module Config
   ROOT = File.expand_path("..", __dir__)
 
   # sbt + Scala + JDK, fully pinned. Tag format: eclipse-temurin-<jdk>_<sbt>_<scala>
-  SBT_IMAGE = "docker.io/sbtscala/scala-sbt:eclipse-temurin-21.0.12_8_1.13.0_2.13.18"
+  # The tag also lives in .env (PCL_SBT_IMAGE) so the Dagster image runs the
+  # assembled jar on exactly the same JVM as the Rake tasks.
+  SBT_IMAGE_DEFAULT = "docker.io/sbtscala/scala-sbt:eclipse-temurin-21.0.12_8_1.13.0_2.13.18"
 
   # Named volumes keep sbt's build output on the container's native filesystem.
   # The Windows/WSL bind mount rejects the file-timestamp writes sbt performs in
@@ -142,6 +144,13 @@ module Config
     "localhost/pcl-spark:#{version}-iceberg-#{iceberg}"
   end
 
+  # JVM used to run the assembled pipeline jar. Defaults without requiring .env,
+  # because `rake verify` and `rake compile` must work on a fresh clone.
+  def self.sbt_image(env = nil)
+    env ||= File.exist?(ENV_FILE) ? load_env! : {}
+    env.fetch("PCL_SBT_IMAGE", SBT_IMAGE_DEFAULT)
+  end
+
   # Render the Iceberg catalog and S3 settings for the Spark session. The output
   # holds credentials and lives under the gitignored .local/ directory.
   def self.render_spark_conf!(env = load_env!)
@@ -203,7 +212,7 @@ module Build
       # Give the JVM enough heap for the large Beam/Flink/Iceberg classpath.
       "-e", "JAVA_OPTS=-Xmx3g -Xms1g",
       "--entrypoint", "sbt",
-      Config::SBT_IMAGE,
+      Config.sbt_image,
       *sbt_args
     ]
     run!(*argv)

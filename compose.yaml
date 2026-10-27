@@ -237,6 +237,53 @@ services:
       retries: 12
       start_period: 120s
 
+  # --- Dagster (scheduled orchestration) ------------------------------------
+  #
+  # The webserver only serves the UI and loads the code location, so it needs no
+  # engine access and lives here like any other service. The daemon executes runs
+  # and starts Spark/Beam as sibling containers, so it needs the Podman socket;
+  # `rake dagster:up` starts it with the engine client directly, because
+  # podman-compose rewrites absolute bind sources on Windows and turns the socket
+  # into an empty directory. Bind mounts inside the containers it starts are
+  # resolved by the host engine, so PCL_HOST_WORKSPACE holds the host repository
+  # path.
+  dagster-webserver:
+    image: localhost/pcl-dagster:${PCL_DAGSTER_VERSION:-1.13.27}
+    build:
+      context: ./infra/dagster
+    container_name: pcl-dagster-webserver
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DAGSTER_HOME: /opt/dagster/home
+    command:
+      - dagster-webserver
+      - -h
+      - 0.0.0.0
+      - -p
+      - "3000"
+      - -w
+      - /opt/dagster/app/workspace.yaml
+    volumes:
+      - ./infra/dagster/dagster.yaml:/opt/dagster/home/dagster.yaml:ro
+      - dagster_home:/opt/dagster/home/storage
+    ports:
+      - "127.0.0.1:${PCL_DAGSTER_PORT:-3000}:3000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen("http://localhost:3000/server_info")
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
   # Apache Spark is the batch transformation layer: it owns the Iceberg DDL, the
   # incremental MERGE into silver, and the replay rebuild. Trino never writes.
   #
@@ -309,3 +356,4 @@ volumes:
   minio_data:
   trino_data:
   flink_checkpoints:
+  dagster_home:

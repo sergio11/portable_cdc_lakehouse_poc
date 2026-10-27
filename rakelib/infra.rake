@@ -135,7 +135,9 @@ module Infra
   # Create the Polaris database/schema when upgrading an existing Postgres
   # volume. The init script only runs on a brand-new volume, and Polaris refuses
   # to start if its schema is missing.
-  def ensure_polaris_database!(env = Config.load_env!)
+  # Create a Postgres database if it does not exist yet. The init scripts only
+  # run on a brand-new volume, so an existing stack is upgraded in place.
+  def ensure_database!(name, env = Config.load_env!)
     password = env.fetch("PCL_POSTGRES_PASSWORD")
     user = env.fetch("PCL_POSTGRES_USER")
     database = env.fetch("PCL_POSTGRES_DB")
@@ -143,22 +145,28 @@ module Infra
     exists = capture(
       Config::POSTGRES_IMAGE,
       "psql", "-h", "postgres", "-U", user, "-d", database, "-tAc",
-      "SELECT 1 FROM pg_database WHERE datname = 'polaris'",
+      "SELECT 1 FROM pg_database WHERE datname = '#{name}'",
       environment: { "PGPASSWORD" => password }
     ).strip == "1"
+    return if exists
 
-    unless exists
-      run!(
-        "podman", "run", "--rm", "--network", "pcl_default",
-        "-e", "PGPASSWORD",
-        Config::POSTGRES_IMAGE,
-        "psql", "-v", "ON_ERROR_STOP=1",
-        "-h", "postgres", "-U", user, "-d", database,
-        "-c", "CREATE DATABASE polaris",
-        environment: { "PGPASSWORD" => password }
-      )
-      puts "Created Postgres database 'polaris' for Apache Polaris."
-    end
+    run!(
+      "podman", "run", "--rm", "--network", "pcl_default",
+      "-e", "PGPASSWORD",
+      Config::POSTGRES_IMAGE,
+      "psql", "-v", "ON_ERROR_STOP=1",
+      "-h", "postgres", "-U", user, "-d", database,
+      "-c", "CREATE DATABASE #{name}",
+      environment: { "PGPASSWORD" => password }
+    )
+    puts "Created Postgres database '#{name}'."
+  end
+
+  def ensure_polaris_database!(env = Config.load_env!)
+    password = env.fetch("PCL_POSTGRES_PASSWORD")
+    user = env.fetch("PCL_POSTGRES_USER")
+
+    ensure_database!("polaris", env)
 
     run!(
       "podman", "run", "--rm", "--network", "pcl_default",
@@ -482,6 +490,7 @@ namespace :infra do
     Infra.compose("up", "--build", "-d", "postgres")
     Infra.wait_until!("Postgres") { Infra.postgres_ready? }
     Infra.ensure_polaris_database!(env)
+    Infra.ensure_database!("dagster", env)
     Infra.compose("up", "--build", "-d")
 
     Infra.wait_until!("Kafka broker")       { Infra.kafka_ready? }
@@ -493,6 +502,10 @@ namespace :infra do
     end
     Infra.wait_until!("Polaris catalog 'pcl' (polaris-setup)") { Infra.polaris_catalog_ready?(env) }
     Infra.wait_until!("Trino REST")         { Infra.http_ok?("http://localhost:#{env.fetch('PCL_TRINO_PORT')}/v1/info") }
+    Infra.wait_until!("Dagster webserver")  { Infra.http_ok?("#{Dagster.ui_url(env)}/server_info") }
+    # The daemon needs Kafka and Trino to be up, because the first scheduled tick
+    # may fire immediately; starting it last keeps that first run green.
+    Dagster.start_daemon!(env)
 
     puts "\nAll services ready."
     puts "  Trino    http://localhost:#{env.fetch('PCL_TRINO_PORT')}"
@@ -500,11 +513,15 @@ namespace :infra do
     puts "  MinIO    http://localhost:#{env.fetch('PCL_MINIO_CONSOLE_PORT')}"
     puts "  Polaris  http://localhost:#{env.fetch('PCL_ICEBERG_CATALOG_PORT')}/api/catalog"
     puts "  Polaris health  http://localhost:#{env.fetch('PCL_POLARIS_HEALTH_PORT', '8182')}/q/health"
+    puts "  Dagster  #{Dagster.ui_url(env)}"
   end
 
   desc "Stop the stack, keeping volumes (the CDC history is preserved)"
   task :down do
     Config.load_env!
+    # Not part of the Compose file (see Dagster.start_daemon!); stop it first so
+    # no run is mid-flight when the services it talks to disappear.
+    Dagster.stop_daemon!
     Infra.compose("--profile", "flink", "down")
   end
 
@@ -534,6 +551,7 @@ namespace :infra do
     end
 
     Config.load_env!
+    Dagster.stop_daemon!
     Infra.compose("--profile", "flink", "down", "-v")
     puts "Volumes removed. `rake infra:up` rebuilds an empty environment."
   end

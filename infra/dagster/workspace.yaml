@@ -1,0 +1,6 @@
+# The code location is a package, so it is loaded as a module: importing it as a
+# plain file would break the relative imports inside `pcl_dagster`.
+load_from:
+  - python_module:
+      module_name: pcl_dagster.definitions
+      working_directory: /opt/dagster/app

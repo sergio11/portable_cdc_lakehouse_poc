@@ -1,0 +1,16 @@
+# Run and event history live in the same PostgreSQL instance as the rest of the
+# stack, in their own database, so the orchestrator survives container restarts
+# without a local SQLite file. Credentials come from the container environment.
+storage:
+  postgres:
+    postgres_db:
+      username:
+        env: PCL_POSTGRES_USER
+      password:
+        env: PCL_POSTGRES_PASSWORD
+      hostname: postgres
+      port: 5432
+      db_name: dagster
+
+telemetry:
+  enabled: false
