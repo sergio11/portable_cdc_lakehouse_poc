@@ -244,7 +244,7 @@ The `silver.orders_current` projection is refreshed separately with Spark; in a 
 
 ## 📸 Results from the running POC
 
-The screenshots and outputs below come from one continuous session on 26 October 2026. The same Beam graph ran first with DirectRunner and then as an unbounded streaming job on a separate Flink cluster, both writing to the same Iceberg tables through Apache Polaris.
+The outputs below come from the session on 27 October 2026; the Flink dashboard screenshots are from the continuous run of the same job on 26 October. The Beam graph ran with DirectRunner and with the FlinkRunner, both writing to the same Iceberg tables through Apache Polaris, and Spark then transformed that history.
 
 ### 1. Apache Polaris owns the catalog
 
@@ -294,7 +294,7 @@ The bounded DirectRunner pass read 15 Kafka records, accepted 13, and counted 2 
 elements_read=15  accepted_events=13  kafka_tombstones=2  dataFilesWritten=1
 ```
 
-The FlinkRunner job started from the earliest offset because no consumer offsets were committed, so it appended a second batch of 13 accepted events. The audit table now holds 26 rows for 13 distinct event ids, which is the at-least-once behavior the projection is designed to absorb.
+The FlinkRunner job started from the earliest offset because no consumer offsets were committed, so it appended a second batch of 13 accepted events. A third bounded pass, used for the dead-letter check below, appended the same 13 events once more. The audit table now holds 39 rows for 13 distinct event ids, which is the at-least-once behavior the projection is designed to absorb.
 
 In this session both passes were bounded to 15 records. The screenshots below come from the earlier continuous run of the same job, which stayed up long enough to accumulate checkpoints:
 
@@ -323,24 +323,24 @@ Time taken: 0.112 seconds
 Iceberg tables ready (spark-sql, catalog pcl).
 ```
 
-The first materialization after the DirectRunner batch read the watermark (epoch), rescanned the seven changed keys, and committed a new snapshot. After the FlinkRunner batch appended the same events again, the watermark had already advanced, so the next run only re-read the boundary key and the `MERGE` changed nothing: Iceberg skipped the empty commit.
+The first materialization after the DirectRunner batch read the watermark (epoch) and rescanned the seven changed keys. Each later pass rescanned the same seven keys, because their events had arrived again, and converged on the same result. The `MERGE` is idempotent but not free: Spark rewrites the files that contain matched rows, so a run commits an overwrite snapshot even when no business value changes.
 
 ```text
 $ rake lakehouse:materialize
 $ podman run --rm --network pcl_default ... localhost/pcl-spark:3.5.9-iceberg-1.11.0 \
     /opt/spark/bin/spark-sql --properties-file /opt/pcl/conf/spark-defaults.conf -f /opt/pcl/conf/work/materialize_orders.sql
-Spark master: local[*], Application Id: local-1793130985448
-Time taken: 13.075 seconds
-Time taken: 0.274 seconds
-Time taken: 0.456 seconds
-Time taken: 0.468 seconds
-Time taken: 1.087 seconds
-changed_keys	1
-Time taken: 15.305 seconds, Fetched 1 row(s)
-projected_keys	1
-Time taken: 11.251 seconds, Fetched 1 row(s)
-Time taken: 29.515 seconds
-Time taken: 7.063 seconds
+Spark master: local[*], Application Id: local-1793132074739
+Time taken: 7.515 seconds
+Time taken: 0.265 seconds
+Time taken: 0.366 seconds
+Time taken: 0.332 seconds
+Time taken: 0.613 seconds
+changed_keys	7
+Time taken: 15.706 seconds, Fetched 1 row(s)
+projected_keys	7
+Time taken: 6.102 seconds, Fetched 1 row(s)
+Time taken: 18.167 seconds
+Time taken: 2.344 seconds
 Current-state projection refreshed (spark-sql, catalog pcl).
 ```
 
@@ -352,12 +352,17 @@ ops | cdc_dead_letter
 ops | materialization_state
 raw | order_cdc_events
 silver | orders_current
+silver | orders_current_replay_readme_proof
 
 == current-state snapshots
-6413925175051381393 | append | 2026-10-27 19:36:03.249 UTC
+4705716679392310919 | overwrite | 2026-10-27 20:15:40.567 UTC
+1414936190202702993 | overwrite | 2026-10-27 19:58:06.729 UTC
+1580568179560580880 | overwrite | 2026-10-27 19:47:57.356 UTC
+319887680504692394  | overwrite | 2026-10-27 19:45:20.538 UTC
+6413925175051381393 | append    | 2026-10-27 19:36:03.249 UTC
 
 == materialization watermark
-silver.orders_current | 2026-10-27 19:43:00.429 UTC | 2026-10-27 19:45:24.558 UTC
+silver.orders_current | 2026-10-27 20:13:11.514 UTC | 2026-10-27 20:15:40.854 UTC
 ```
 
 Trino cannot write, and it is the engine that enforces it:
@@ -386,7 +391,7 @@ false | 6
 true  | 1
 
 -- 2. Duplicate delivery report.
-13 | 13
+13 | 26
 
 -- 5. Discrepancy report.
 1001 | 31464144 | 31464144 | UPDATE | UPDATE | false | false | ok
@@ -406,7 +411,54 @@ Replay readme_proof materialized to pcl.silver.orders_current_replay_readme_proo
 Full replay readme_proof matches silver.orders_current exactly.
 ```
 
-### 5. Terminal evidence
+A bounded replay applies the same logic to an inclusive LSN window, so the target holds only the keys that changed inside it:
+
+```text
+$ $env:PCL_REPLAY_ID='window_probe'
+$ $env:PCL_REPLAY_FROM_LSN='31464100'; $env:PCL_REPLAY_TO_LSN='31465000'
+$ rake lakehouse:replay
+Replay window_probe materialized to pcl.silver.orders_current_replay_window_probe: 5 keys, 1 tombstones.
+```
+
+```text
+SELECT order_id, status, is_deleted, last_lsn
+  FROM iceberg.silver.orders_current_replay_window_probe ORDER BY order_id;
+
+1001 | PAID | false | 31464144
+1002 | PAID | false | 31464704
+1003 | NEW  | false | 31464104
+1004 |      | true  | 31464816
+1005 | NEW  | false | 31464960
+```
+
+Orders 1006 and 1007 are absent because their events fall outside the window. A bounded replay is a partial history by construction, so `lakehouse:replay` reports its shape instead of asserting equality with the live projection.
+
+### 5. Invalid envelopes are quarantined, not dropped
+
+Four deliberately invalid envelopes were published to the same Kafka topic: truncated JSON, an unknown `op`, a delete with no row image, and an update with no primary key. The next bounded pass read 19 records, accepted 13, and rejected 4:
+
+```text
+elements_read=19  accepted_events=13  rejected_events=4  kafka_tombstones=2  dataFilesWritten=1
+```
+
+Each rejection keeps a stable reason code, the original payload, and the run that observed it:
+
+```text
+-- 7. Dead letter overview, by reason code.
+INCONSISTENT_PAYLOAD | 1
+MALFORMED_JSON       | 1
+MISSING_PRIMARY_KEY  | 1
+UNKNOWN_OPERATION    | 1
+
+MALFORMED_JSON       | - | {"op":"c","after":
+UNKNOWN_OPERATION    | - | {"op":"x","after":{"order_id":9001,"status":"GHOST"}
+INCONSISTENT_PAYLOAD | - | {"op":"d","source":{"db":"pcl","schema":"public","ta
+MISSING_PRIMARY_KEY  | - | {"op":"u","after":{"status":"NO_KEY"},"source":{"db"
+```
+
+`event_id` is empty on purpose: the envelope never reached identity derivation, so there is no canonical id to attach. The payload and the Kafka reference are what make the record diagnosable, and none of the four reached `raw` or `silver`.
+
+### 6. Terminal evidence
 
 A single capture of the commands behind the state above, from `infra:up` to the read-only rejection:
 
@@ -417,10 +469,11 @@ A single capture of the commands behind the state above, from `infra:up` to the 
 - PostgreSQL CDC events travel through Debezium and Kafka into Beam, and the FlinkRunner job runs on the local Flink cluster with checkpointing enabled.
 - Spark creates the Iceberg tables, applies the incremental `MERGE`, and rebuilds the projection on replay, all through Apache Polaris; deletes are represented as tombstones.
 - Trino is read-only: it answers reconciliation and inspection queries, and the engine rejects `CREATE`, `INSERT`, `MERGE`, `DROP`, and `ALTER`.
-- Reconciliation compares business columns, tombstone state, operation, and source position, not only key counts. A full replay must match the live projection exactly.
+- Reconciliation compares business columns, tombstone state, operation, and source position, not only key counts. A full replay must match the live projection exactly, and a bounded replay contains only the keys inside its LSN window.
 - Raw history is append-only. Repeated delivery is expected under at-least-once processing and is handled by deduplicating on `event_id`; the duplicate report makes it visible.
+- Invalid envelopes never reach `raw` or `silver`: they land in `ops.cdc_dead_letter` with a stable reason code, the original payload, and the run that saw them, and the pipeline keeps going.
 
-This is a **proof of concept**, not a production-ready platform. Restart/recovery behavior is exercised at the checkpoint-configuration level, not through a sustained failure-injection campaign. Invalid-message integration checks and performance benchmarking remain unvalidated. Exactly-once processing and production throughput are not claimed.
+This is a **proof of concept**, not a production-ready platform. Restart/recovery behavior is exercised at the checkpoint-configuration level, not through a sustained failure-injection campaign. Performance benchmarking, schema evolution, and a second source table remain unvalidated. Exactly-once processing and production throughput are not claimed.
 
 ## 📜 License
 

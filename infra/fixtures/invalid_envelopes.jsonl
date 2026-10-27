@@ -1,0 +1,4 @@
+{"op":"c","after":
+{"op":"x","after":{"order_id":9001,"status":"GHOST"},"source":{"db":"pcl","schema":"public","table":"orders","lsn":40000000,"txId":900,"sequence":"[\"900\",\"1\"]","ts_ms":1793130000000},"ts_ms":1793130000000}
+{"op":"d","source":{"db":"pcl","schema":"public","table":"orders","lsn":40000001,"txId":901,"sequence":"[\"901\",\"1\"]","ts_ms":1793130001000},"ts_ms":1793130001000}
+{"op":"u","after":{"status":"NO_KEY"},"source":{"db":"pcl","schema":"public","table":"orders","lsn":40000002,"txId":902,"sequence":"[\"902\",\"1\"]","ts_ms":1793130002000},"ts_ms":1793130002000}
