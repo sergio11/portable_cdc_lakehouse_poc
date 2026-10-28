@@ -4,7 +4,7 @@
 
 Portable CDC Lakehouse is a local Proof of Concept (POC) for capturing database changes, processing them as a stream, and storing both change history and current state in an open table format.
 
-It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Spark, Apache Flink, Apache Iceberg, Apache Polaris, MinIO, Trino, and Dagster. The same Beam graph runs on DirectRunner and on the classic FlinkRunner with separate JobManager and TaskManager containers. Batch transformation runs on Spark, Dagster runs the incremental graph every five minutes, and Trino is strictly read-only.
+It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Spark, Apache Flink, Apache Iceberg, Apache Polaris, MinIO, Trino, and Dagster. The same Beam graph runs on DirectRunner and on the classic FlinkRunner with separate JobManager and TaskManager containers. Batch transformation runs on Spark, Dagster runs the incremental graph every five minutes, and Trino serves the results to SQL clients.
 
 ## ⚠️ Disclaimer
 
@@ -12,7 +12,7 @@ This repository is an open-source engineering experiment intended for learning a
 
 ## 🎯 Project goal
 
-The goal is to make the path from a relational database change to an auditable lakehouse table visible and reproducible. The POC focuses on the boundaries that are easy to get wrong in streaming systems: CDC envelope normalization, source-position ordering, duplicate delivery, delete tombstones, replay, the interaction between Beam runners and Iceberg storage, and the separation between batch transformation and read-only serving.
+The goal is to make the path from a relational database change to an auditable lakehouse table visible and reproducible. The POC focuses on the boundaries that are easy to get wrong in streaming systems: CDC envelope normalization, source-position ordering, duplicate delivery, delete tombstones, replay, the interaction between Beam runners and Iceberg storage, and the separation between batch transformation and serving.
 
 ## ⚖️ Why this architecture
 
@@ -42,7 +42,7 @@ The trade-off is explicit: more moving parts (Kafka, Flink, Spark, Iceberg, Pola
 - ⚡ Transform with Spark SQL: Iceberg DDL, an incremental `MERGE`, and replay.
 - 🗓️ Run the incremental graph on a Dagster schedule, with asset checks gating each run.
 - 🔁 Replay raw history into an isolated Iceberg table.
-- 🔎 Serve with Trino, which is configured read-only at the engine level.
+- 🔎 Serve with Trino, decoupled from ingestion and transformation.
 - 📦 Run local dependencies with Podman; operate the POC through Rake commands.
 
 ## 🏗️ Architecture
@@ -60,7 +60,7 @@ flowchart TD
     SPARK --> SILVER[(Iceberg silver<br/>orders_current)]
     SPARK --> STATE[(Iceberg ops<br/>materialization_state)]
 
-    RAW --> TRINO[Trino<br/>read-only serving]
+    RAW --> TRINO[Trino<br/>SQL serving]
     SILVER --> TRINO
 
     DAG[Dagster<br/>every 5 minutes] -.->|lag and offsets| K
@@ -78,7 +78,7 @@ Polaris serves the Iceberg catalog and MinIO stores the data files for every tab
 4. With DirectRunner, the Beam process executes locally in its temporary container. With FlinkRunner, that container submits the job and waits while Flink executes Beam operators in the TaskManager. The streaming job checkpoints every 10 seconds with RocksDB and externalized checkpoints, so a restart has a durable state snapshot. In continuous mode, the submitter and Flink services stay active until the job is stopped.
 5. Spark SQL materializes `silver.orders_current`. It reads the watermark from `ops.materialization_state`, selects the keys that received arrivals since the last run, re-ranks the full history of only those keys, applies an idempotent `MERGE`, and advances the watermark after the commit. Deletes become versioned tombstones. Raw rows are deduplicated by `event_id` before ranking, because Kafka delivery is at-least-once. A run with no raw event newer than the watermark skips Spark entirely.
 6. `lakehouse:replay` and `dagster:replay` drop and recreate an isolated target table with Spark and rebuild it from all raw events or an inclusive LSN range. They do not update the canonical current-state table or the watermark.
-7. Trino only reads: it inspects the Iceberg tables, snapshots, counts, and reconciliation discrepancies. Its access control rejects every write operation.
+7. Trino serves the lakehouse: it inspects tables and snapshots and answers reconciliation and business queries, separately from ingestion and transformation.
 
 The scheduled run, from the orchestrator's point of view:
 
@@ -127,7 +127,7 @@ DirectRunner executes the graph locally and is useful during development. The cl
 
 ### ⚡ Apache Spark — batch transformation layer
 
-Spark owns everything that writes `silver`: the Iceberg DDL, the incremental `MERGE` from `raw`, and the replay rebuild. It runs as a one-shot `spark-sql` container on the Compose network, so the POC needs no long-lived cluster; the image is built once with the Iceberg runtime baked in. Keeping transformation out of Beam avoids a stateful streaming job and a custom Iceberg sink, and keeping it out of Trino preserves the layer boundary: Trino serves, Spark transforms. The artifact that is portable here is the SQL, not a runner.
+Spark owns everything that writes `silver`: the Iceberg DDL, the incremental `MERGE` from `raw`, and the replay rebuild. It runs as a one-shot `spark-sql` container on the Compose network, so the POC needs no long-lived cluster; the image is built once with the Iceberg runtime baked in. This keeps Beam focused on streaming ingestion and Spark on set-based transformation, and the portable artifact is the SQL rather than a runner.
 
 ### 🧊 Apache Iceberg — open table format
 
@@ -141,15 +141,13 @@ MinIO gives Beam, Spark and Trino a shared S3 API endpoint without requiring a c
 
 Beam, Spark and Trino resolve the same Iceberg tables and snapshots through one REST catalog endpoint. Apache Polaris provides that endpoint, and its metadata lives in a dedicated `polaris` database inside the same PostgreSQL instance as the source (schema `polaris_schema`), so catalog state survives container restarts and needs no separate store. Clients authenticate with OAuth2 client credentials and use their own S3 credentials for data files, since MinIO does not provide STS.
 
-### 🔎 Trino — read-only serving layer
+### 🔎 Trino — SQL serving layer
 
-Trino is the serving layer: it answers business queries, reconciliation, and snapshot inspection. It does not create tables, merge, or replay. The POC mounts Trino's built-in `read-only` system access control, so `INSERT`, `CREATE`, `MERGE`, `DROP`, and `ALTER` are rejected by the engine even if they arrive from the CLI, a notebook, or a BI tool. `rake query:file` adds an allowlist on top of that boundary for a clearer error message.
+Trino is the SQL serving layer: it reads the Iceberg tables through Polaris and answers business queries, snapshot inspection and reconciliation without loading PostgreSQL. Running it separately from Spark keeps interactive queries away from ingestion and batch transformation, and any SQL client can use it through the standard Trino endpoint.
 
 ### 🗓️ Dagster — scheduled orchestration
 
-Dagster is the scheduled entrypoint, not a second implementation: every asset runs the same pinned Spark and Beam containers the Rake tasks run, through the Podman socket. `raw_cdc_events` measures the consumer-group lag with `confluent-kafka`, starts a bounded Beam read of exactly that many records, and commits the offsets only when the append succeeded and the record count matches the lag. A short read leaves the offsets untouched, so the next run re-reads and deduplicates on `event_id`. `orders_current` skips Spark when no raw event arrived after the watermark, so an idle tick costs one query instead of a JVM and an Iceberg overwrite. Two asset checks gate each run: no envelope in the batch was quarantined, and the projection still agrees with the replayed history.
-
-Run and event history live in a `dagster` database inside the same PostgreSQL instance as the source, so the orchestrator survives container restarts and needs no extra service. The webserver runs in Compose; the daemon is started by `rake dagster:up` with the engine client, which mounts the Podman socket reliably on Windows. Replay is deliberately outside the schedule: `rake dagster:replay[id,from_lsn,to_lsn]` runs the replay job with an explicit window.
+Dagster is the scheduled entrypoint: every five minutes it runs the same pinned Spark and Beam containers the Rake tasks run, so there is no second implementation. Each run measures the Kafka lag, reads only that many records, and commits the offsets after a complete append; when nothing arrived, it skips Spark instead of rewriting `silver`. Two asset checks gate each run, and run history lives in a `dagster` database in the same PostgreSQL instance. Replay stays explicit: `rake dagster:replay[id,from_lsn,to_lsn]`.
 
 ### 📦 Podman, Compose, and Rake — reproducible local operations
 
@@ -170,7 +168,7 @@ Podman runs the services and job containers without requiring Docker Engine. Com
 | Debezium Connect | 3.2.4.Final | PostgreSQL connector task reached RUNNING |
 | Apache Iceberg | 1.11.0 | Beam write, Spark transform, Trino read |
 | Apache Polaris | 1.8.0 | OAuth2 catalog API, Postgres metastore, MinIO storage |
-| Trino | 476 | Read-only queries, reconciliation, snapshot inspection |
+| Trino | 476 | Serving queries, reconciliation, snapshot inspection |
 | Dagster / dagster-postgres | 1.13.27 / 0.29.27 (Python 3.12, SQLAlchemy 2.0.55) | Scheduled runs, asset checks, Postgres-backed history |
 | confluent-kafka (Dagster image) | 2.16.0 | Consumer-group lag measurement and offset commit |
 | MinIO | `RELEASE.2025-10-15T17-29-55Z`, built with Go 1.24.8 | Bucket and Iceberg object writes exercised |
@@ -348,17 +346,7 @@ silver | orders_current_replay_window_probe
 silver.orders_current | 2026-10-27 21:50:53.055 UTC | 2026-10-27 21:53:31.171 UTC
 ```
 
-Trino cannot write, and it is the engine that enforces it:
-
-```text
-$ curl -X POST localhost:8080/v1/statement -d 'CREATE TABLE iceberg.silver.readonly_probe (x BIGINT)'
-Access Denied: Cannot create table iceberg.silver.readonly_probe
-
-$ rake "query:file[.local/readonly_probe.sql]"
-query:file is read-only and cannot run CREATE.
-Allowed: SELECT, WITH, SHOW, DESCRIBE, DESC, EXPLAIN, VALUES, TABLE.
-Writes belong to Spark: rake lakehouse:init, lakehouse:materialize, lakehouse:replay.
-```
+`lakehouse:describe` reads those tables, snapshots and the watermark through Trino, the same endpoint any SQL client uses.
 
 Polaris prefixes each table location with a UUID. The raw table's Parquet and metadata files are visible in the MinIO object browser:
 
@@ -504,7 +492,7 @@ $ rake "dagster:replay[readme_proof]"
 
 ### 7. Terminal evidence
 
-A single capture of the commands behind the state above, from `infra:up` to the read-only rejection:
+A single capture of the commands behind the state above:
 
 ![Terminal evidence for the full run](docs/screenshots/06-terminal-evidence.png)
 
