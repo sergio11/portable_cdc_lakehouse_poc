@@ -1,8 +1,9 @@
 """Dagster entrypoint: assets, checks, the incremental schedule and replay.
 
 The schedule materialises the graph every five minutes. Each run is incremental:
-the ingestion step only reads what is pending in Kafka and the transformation
-step only merges what arrived since the watermark.
+the ingestion step only reads what is pending in Kafka, merges those deliveries
+into canonical raw by event_id, and the transformation step only merges what
+arrived since the watermark.
 """
 
 from dagster import (
@@ -14,13 +15,14 @@ from dagster import (
 )
 
 from .assets import (
-    batch_fully_accepted,
+    batch_fully_accounted,
     debezium_connector,
     lakehouse_tables,
     orders_current,
     orders_current_replay,
     projection_matches_history,
     raw_cdc_events,
+    raw_events_unique,
 )
 from .config import env
 from .resources import Kafka, Podman, Trino
@@ -28,7 +30,9 @@ from .resources import Kafka, Podman, Trino
 incremental_job = define_asset_job(
     name="pcl_incremental",
     selection=AssetSelection.assets(raw_cdc_events, orders_current).upstream()
-    | AssetSelection.checks(batch_fully_accepted, projection_matches_history),
+    | AssetSelection.checks(
+        batch_fully_accounted, raw_events_unique, projection_matches_history
+    ),
 )
 
 replay_job = define_asset_job(
@@ -44,7 +48,7 @@ defs = Definitions(
         orders_current,
         orders_current_replay,
     ],
-    asset_checks=[batch_fully_accepted, projection_matches_history],
+    asset_checks=[batch_fully_accounted, raw_events_unique, projection_matches_history],
     jobs=[incremental_job, replay_job],
     schedules=[
         ScheduleDefinition(

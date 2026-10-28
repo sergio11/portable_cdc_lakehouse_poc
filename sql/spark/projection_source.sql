@@ -1,6 +1,6 @@
 -- Shared ranking, spliced into materialize and replay by Rake.
 -- Input: pcl_raw_scope. Output: pcl_projection_source (one row per order).
--- Dedup by event_id absorbs at-least-once delivery; LSN order decides the winner.
+-- Raw is unique by event_id; the dedup below is a defensive no-op. LSN order decides the winner.
 
 CREATE OR REPLACE TEMPORARY VIEW pcl_projection_source AS
 WITH deduped AS (

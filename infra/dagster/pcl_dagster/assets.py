@@ -3,9 +3,10 @@
     debezium_connector ─┐
     lakehouse_tables ───┴─> raw_cdc_events ──> orders_current ──> checks
 
-Every step is idempotent, so a retry or an overlapping tick cannot corrupt the
-tables. Replay is deliberately outside the scheduled graph: it is an explicit
-request with its own window.
+`raw_cdc_events` lands deliveries and merges them into canonical raw by event_id;
+`orders_current` materializes the projection. Every step is idempotent, so a
+retry or an overlapping tick cannot corrupt the tables. Replay is deliberately
+outside the scheduled graph: it is an explicit request with its own window.
 """
 
 import re
@@ -34,6 +35,7 @@ REPLAY_ID = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 EXPECTED_TABLES = (
     ("raw", "order_cdc_events"),
+    ("raw", "order_cdc_events_landing"),
     ("silver", "orders_current"),
     ("ops", "materialization_state"),
     ("ops", "cdc_dead_letter"),
@@ -74,49 +76,99 @@ def lakehouse_tables(context: AssetExecutionContext, trino: Trino, podman: Podma
 @asset(
     deps=[debezium_connector, lakehouse_tables],
     group_name="ingest",
-    description="Appends new Kafka records to raw and advances the consumer group.",
+    description="Lands new Kafka deliveries and merges them into raw, one row per event_id.",
 )
 def raw_cdc_events(
-    context: AssetExecutionContext, kafka: Kafka, podman: Podman
+    context: AssetExecutionContext, kafka: Kafka, trino: Trino, podman: Podman
 ) -> dict[str, int]:
     pending, end_offsets = kafka.lag()
-    context.add_output_metadata({"pending_records": pending})
-
-    if pending == 0:
-        # An idle tick must not start a JVM: report it and leave the offsets alone.
-        context.log.info("No pending records for %s.", kafka.topic)
-        return {"pending": 0, "read": 0, "accepted": 0, "rejected": 0}
-
-    ensure_pipeline_jar(podman)
-    context.log.info("Reading %d pending records from %s.", pending, kafka.topic)
-    metrics = run_beam(podman, pending)
-
-    read = metrics.get("elements_read", 0)
-    accepted = metrics.get("accepted_events", 0)
-    rejected = metrics.get("rejected_events", 0)
+    landing = int(
+        trino.scalar("SELECT count(*) FROM iceberg.raw.order_cdc_events_landing") or 0
+    )
+    duplicates = int(
+        trino.scalar(
+            """SELECT count(*)
+                 FROM (
+                   SELECT event_id
+                     FROM iceberg.raw.order_cdc_events
+                    GROUP BY event_id
+                   HAVING count(*) > 1
+                 ) duplicated"""
+        )
+        or 0
+    )
     context.add_output_metadata(
         {
             "pending_records": pending,
-            "records_read": read,
-            "accepted_events": accepted,
-            "rejected_events": rejected,
-            "kafka_tombstones": metrics.get("kafka_tombstones", 0),
-            "data_files_written": metrics.get("dataFilesWritten", 0),
+            "landing_backlog": landing,
+            "raw_duplicates_before": duplicates,
         }
     )
 
-    # Only advance when the bounded read consumed the whole snapshot. A partial
-    # read leaves the offsets untouched, which re-reads and deduplicates instead
-    # of silently skipping records.
-    if read == pending:
+    if pending == 0 and landing == 0 and duplicates == 0:
+        # An idle tick must not start a JVM: report it and leave the offsets alone.
+        context.log.info("No pending records for %s.", kafka.topic)
+        return {
+            "pending": 0,
+            "read": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "tombstones": 0,
+            "landing_rows": 0,
+        }
+
+    read = accepted = rejected = tombstones = 0
+    if pending > 0:
+        ensure_pipeline_jar(podman)
+        context.log.info("Reading %d pending records from %s.", pending, kafka.topic)
+        metrics = run_beam(podman, pending)
+
+        read = metrics.get("elements_read", 0)
+        accepted = metrics.get("accepted_events", 0)
+        rejected = metrics.get("rejected_events", 0)
+        tombstones = metrics.get("kafka_tombstones", 0)
+        context.add_output_metadata(
+            {
+                "pending_records": pending,
+                "records_read": read,
+                "accepted_events": accepted,
+                "rejected_events": rejected,
+                "kafka_tombstones": metrics.get("kafka_tombstones", 0),
+                "data_files_written": metrics.get("dataFilesWritten", 0),
+            }
+        )
+
+    merge_sql = (WORKSPACE / "sql/spark/merge_raw.sql").read_text(encoding="utf-8")
+    merge = spark_metrics(run_spark(podman, merge_sql, "merge_raw"))
+    context.add_output_metadata(
+        {
+            "landing_rows": merge.get("landing_rows", -1),
+            "landing_events": merge.get("landing_events", -1),
+            "landing_duplicates": merge.get("landing_duplicates", -1),
+            "raw_rows": merge.get("raw_rows", -1),
+            "raw_event_ids": merge.get("raw_event_ids", -1),
+            "landing_remaining": merge.get("landing_remaining", -1),
+        }
+    )
+
+    # Commit only after the canonical MERGE. A crash before this point leaves the
+    # offsets uncommitted; the next run re-reads and the MERGE is idempotent.
+    if pending > 0 and read == pending:
         kafka.commit(end_offsets)
-        context.log.info("Committed offsets %s.", end_offsets)
-    else:
+        context.log.info("Committed offsets %s after the merge.", end_offsets)
+    elif pending > 0:
         context.log.warning(
             "Read %d of %d pending records; leaving offsets uncommitted.", read, pending
         )
 
-    return {"pending": pending, "read": read, "accepted": accepted, "rejected": rejected}
+    return {
+        "pending": pending,
+        "read": read,
+        "accepted": accepted,
+        "rejected": rejected,
+        "tombstones": tombstones,
+        "landing_rows": merge.get("landing_rows", 0),
+    }
 
 
 @asset(
@@ -177,18 +229,58 @@ def orders_current(context: AssetExecutionContext, trino: Trino, podman: Podman)
     return {"pending": pending, "keys": keys, "live": live}
 
 
-@asset_check(asset=raw_cdc_events, description="No envelope in the ingested batch was rejected.")
-def batch_fully_accepted(raw_cdc_events: dict) -> AssetCheckResult:
+@asset_check(
+    asset=raw_cdc_events,
+    blocking=True,
+    description="Every record in the batch was accepted, quarantined, or a delete marker.",
+)
+def batch_fully_accounted(raw_cdc_events: dict) -> AssetCheckResult:
+    # Rejections are expected: a malformed envelope is quarantined, not lost. The
+    # invariant is that the batch accounts for every record it read, so a silent
+    # drop fails the run while a dead letter does not.
+    read = raw_cdc_events.get("read", 0)
+    accepted = raw_cdc_events.get("accepted", 0)
     rejected = raw_cdc_events.get("rejected", 0)
+    tombstones = raw_cdc_events.get("tombstones", 0)
+    accounted = accepted + rejected + tombstones
     return AssetCheckResult(
-        passed=rejected == 0,
-        metadata={"rejected_events": rejected},
-        description=f"{rejected} envelopes were quarantined as dead letters.",
+        passed=accounted == read,
+        metadata={
+            "records_read": read,
+            "accepted_events": accepted,
+            "rejected_events": rejected,
+            "kafka_tombstones": tombstones,
+        },
+        description=f"{accounted} of {read} records were accepted, quarantined, or delete markers.",
+    )
+
+
+@asset_check(
+    asset=raw_cdc_events, blocking=True, description="raw holds exactly one row per event_id."
+)
+def raw_events_unique(trino: Trino) -> AssetCheckResult:
+    duplicates = int(
+        trino.scalar(
+            """SELECT count(*)
+                 FROM (
+                   SELECT event_id
+                     FROM iceberg.raw.order_cdc_events
+                    GROUP BY event_id
+                   HAVING count(*) > 1
+                 ) duplicated"""
+        )
+        or 0
+    )
+    return AssetCheckResult(
+        passed=duplicates == 0,
+        metadata={"duplicated_event_ids": duplicates},
+        description=f"{duplicates} event ids appear more than once in raw.",
     )
 
 
 @asset_check(
     asset=orders_current,
+    blocking=True,
     description="The projection agrees with the replayed history, key by key.",
 )
 def projection_matches_history(trino: Trino) -> AssetCheckResult:

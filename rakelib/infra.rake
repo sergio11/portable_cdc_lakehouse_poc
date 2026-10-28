@@ -314,7 +314,7 @@ module Trino
       abort(<<~MSG)
         query:file is read-only and cannot run #{keyword.empty? ? 'an empty statement' : keyword}.
         Allowed: #{READ_ONLY_KEYWORDS.join(', ')}.
-        Writes belong to Spark: rake lakehouse:init, lakehouse:materialize, lakehouse:replay.
+        Writes belong to Spark: rake lakehouse:init, lakehouse:merge, lakehouse:materialize, lakehouse:replay.
       MSG
     end
   end

@@ -3,16 +3,10 @@
 --
 -- Run with:  rake query:file[sql/trino/reconciliation.sql]
 --
--- Trino is read-only here: this file only reads the append-only history and the
--- projection. Transformation lives in Spark (rake lakehouse:*).
---
--- Everything here is derived from raw.order_cdc_events, so the append-only
--- history is the audit trail and the projection is the thing under test.
---
--- Raw rows are deduplicated by event_id first: Kafka delivery is at-least-once
--- and a restart without committed offsets can append the same event again.
--- Comparing the projection against the raw stream without that step would
--- report false duplicates.
+-- raw.order_cdc_events is canonical: Spark merges the landing deliveries into
+-- it with one row per event_id, so the history is the audit trail and the
+-- projection is the thing under test. A duplicate in raw is a failed ingest,
+-- not an expected condition; section 2 asserts that invariant.
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
@@ -25,10 +19,9 @@ SELECT is_deleted, count(*) AS rows_in_projection
  ORDER BY is_deleted;
 
 -- ---------------------------------------------------------------------------
--- 2. Duplicate delivery report. A non-empty result is expected after a replay
---    or a restart without checkpointing; it is not a data-loss condition, but
---    it must be visible. `copies` is the number of times the same event_id was
---    appended to the audit table.
+-- 2. Raw uniqueness invariant. Spark merges landing deliveries by event_id, so
+--    this must always return 0. A non-zero result means the merge did not run
+--    or failed, and materialization would rank duplicated history.
 -- ---------------------------------------------------------------------------
 SELECT count(*) AS duplicated_event_ids,
        coalesce(sum(copies - 1), 0) AS extra_copies
@@ -41,7 +34,15 @@ SELECT count(*) AS duplicated_event_ids,
   ) duplicates;
 
 -- ---------------------------------------------------------------------------
--- 3. Expected key set, derived by replaying the history: the set of keys ever
+-- 3. Landing backlog. Rows wait here only between the Beam append and the
+--    Spark merge; a growing backlog means the merge is not keeping up.
+-- ---------------------------------------------------------------------------
+SELECT count(*)                 AS landing_rows,
+       count(DISTINCT batch_id) AS landing_batches
+  FROM raw.order_cdc_events_landing;
+
+-- ---------------------------------------------------------------------------
+-- 4. Expected key set, derived by replaying the history: the set of keys ever
 --    observed. Any key present in the projection but absent here would be a
 --    phantom row; any key here but absent from the projection a lost row.
 -- ---------------------------------------------------------------------------
@@ -51,7 +52,7 @@ SELECT DISTINCT primary_key AS order_key
  ORDER BY 1;
 
 -- ---------------------------------------------------------------------------
--- 4. Last event per key by source position, which is what the projection is
+-- 5. Last event per key by source position, which is what the projection is
 --    expected to reflect. source_timestamp is deliberately NOT used for
 --    ordering: arrival or wall-clock order is not a valid precedence.
 -- ---------------------------------------------------------------------------
@@ -66,7 +67,7 @@ SELECT primary_key,
  ORDER BY primary_key;
 
 -- ---------------------------------------------------------------------------
--- 5. Discrepancy report. This compares the projection against the latest
+-- 6. Discrepancy report. This compares the projection against the latest
 --    business image in the history, not just the source position. A row here
 --    is a failed reconciliation, not an informational record.
 --
@@ -78,20 +79,7 @@ SELECT primary_key,
 --      operation_mismatch  - last_operation disagrees with the history
 --      *_mismatch          - a business column differs from the latest image
 -- ---------------------------------------------------------------------------
-WITH deduped AS (
-    SELECT *
-      FROM (
-        SELECT e.*,
-               row_number() OVER (
-                 PARTITION BY event_id
-                 ORDER BY ingested_at DESC
-               ) AS dedup_rank
-          FROM raw.order_cdc_events e
-         WHERE table_name = 'orders'
-      ) copies
-     WHERE dedup_rank = 1
-),
-ranked AS (
+WITH ranked AS (
     SELECT primary_key,
            operation,
            lsn,
@@ -106,7 +94,8 @@ ranked AS (
                       seq_no DESC NULLS LAST,
                       event_id DESC
            ) AS event_rank
-      FROM deduped
+      FROM raw.order_cdc_events
+     WHERE table_name = 'orders'
 ),
 expected AS (
     SELECT try_cast(regexp_extract(primary_key, 'order_id=([^#]+)', 1) AS BIGINT) AS order_id,
@@ -161,7 +150,7 @@ SELECT expected.order_id,
  ORDER BY discrepancy, expected.order_id;
 
 -- ---------------------------------------------------------------------------
--- 6. Event counts per operation, the headline observability counter.
+-- 7. Event counts per operation, the headline observability counter.
 -- ---------------------------------------------------------------------------
 SELECT operation,
        count(*)                            AS events,
@@ -173,7 +162,7 @@ SELECT operation,
  ORDER BY operation;
 
 -- ---------------------------------------------------------------------------
--- 7. Dead letter overview, by reason code.
+-- 8. Dead letter overview, by reason code.
 -- ---------------------------------------------------------------------------
 SELECT reason_code, count(*) AS rejected_events
   FROM ops.cdc_dead_letter

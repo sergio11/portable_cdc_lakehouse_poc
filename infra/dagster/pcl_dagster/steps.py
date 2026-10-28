@@ -100,10 +100,14 @@ def run_spark(podman: Podman, sql: str, name: str) -> str:
 
 
 def spark_metrics(output: str) -> dict[str, int]:
-    """Pick up the `metric<TAB>value` rows the transformation scripts select."""
+    """Pick up the `metric<TAB>value` rows the SQL scripts select."""
     metrics: dict[str, int] = {}
+    pattern = re.compile(
+        r"^(changed_keys|projected_keys|landing_rows|landing_events|"
+        r"landing_duplicates|raw_rows|raw_event_ids|landing_remaining)\s+(\d+)$"
+    )
     for line in output.splitlines():
-        match = re.match(r"^(changed_keys|projected_keys)\s+(\d+)$", line.strip())
+        match = pattern.match(line.strip())
         if match:
             metrics[match.group(1)] = int(match.group(2))
     return metrics
@@ -119,7 +123,7 @@ def ensure_pipeline_jar(podman: Podman) -> None:
 
 
 def run_beam(podman: Podman, max_records: int) -> dict[str, int]:
-    """Read at most `max_records` from Kafka and append them to raw.
+    """Read at most `max_records` from Kafka and append them to the landing table.
 
     The bounded read stops exactly at the offset snapshot taken before the run,
     which is what lets the caller advance the consumer group afterwards.

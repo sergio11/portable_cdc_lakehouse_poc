@@ -5,7 +5,33 @@ CREATE NAMESPACE IF NOT EXISTS pcl.raw;
 CREATE NAMESPACE IF NOT EXISTS pcl.silver;
 CREATE NAMESPACE IF NOT EXISTS pcl.ops;
 
+-- Canonical history: one row per event_id, written only by the merge in
+-- sql/spark/merge_raw.sql.
 CREATE TABLE IF NOT EXISTS pcl.raw.order_cdc_events (
+    event_id               STRING         NOT NULL,
+    source_id              STRING         NOT NULL,
+    schema_name            STRING         NOT NULL,
+    table_name             STRING         NOT NULL,
+    primary_key            STRING         NOT NULL,
+    operation              STRING         NOT NULL,
+    lsn                    BIGINT         NOT NULL,
+    tx_id                  STRING,
+    seq_no                 BIGINT,
+    source_timestamp       TIMESTAMP,
+    connector_timestamp    TIMESTAMP,
+    is_snapshot            BOOLEAN        NOT NULL,
+    before_image           MAP<STRING, STRING>,
+    after_image            MAP<STRING, STRING>,
+    schema_version         INT            NOT NULL,
+    raw_reference          STRING,
+    batch_id               STRING         NOT NULL,
+    ingested_at            TIMESTAMP      NOT NULL
+) USING iceberg
+TBLPROPERTIES ('format-version' = '2');
+
+-- Landing buffer: Beam appends every delivery here, duplicates included. Spark
+-- merges it into canonical raw and releases the deliveries raw already holds.
+CREATE TABLE IF NOT EXISTS pcl.raw.order_cdc_events_landing (
     event_id               STRING         NOT NULL,
     source_id              STRING         NOT NULL,
     schema_name            STRING         NOT NULL,

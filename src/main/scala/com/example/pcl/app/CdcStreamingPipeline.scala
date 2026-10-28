@@ -24,7 +24,8 @@ import java.time.LocalDateTime
 import java.time.ZoneOffset
 import scala.jdk.CollectionConverters._
 
-/** Shared Beam graph for reading Kafka CDC, validating events, and writing Iceberg history or DLQ.
+/** Shared Beam graph for reading Kafka CDC, validating events, and landing accepted rows in Iceberg
+  * or routing invalid ones to the dead-letter table.
   */
 object CdcStreamingPipeline {
 
@@ -147,16 +148,16 @@ object CdcStreamingPipeline {
         .withOutputTags(RawTag, TupleTagList.of(DeadLetterTag))
     )
 
-    val rawWriter = IcebergIO
+    val landingWriter = IcebergIO
       .writeRows(catalog)
-      .to(TableIdentifier.of("raw", "order_cdc_events"))
+      .to(TableIdentifier.of("raw", "order_cdc_events_landing"))
     val deadLetterWriter = IcebergIO
       .writeRows(catalog)
       .to(TableIdentifier.of("ops", "cdc_dead_letter"))
-    val configuredRawWriter =
-      if (settings.maxRecords > 0) rawWriter
+    val configuredLandingWriter =
+      if (settings.maxRecords > 0) landingWriter
       else
-        rawWriter.withTriggeringFrequency(
+        landingWriter.withTriggeringFrequency(
           org.joda.time.Duration.standardSeconds(settings.writeFrequencySeconds)
         )
     val configuredDeadLetterWriter =
@@ -169,7 +170,7 @@ object CdcStreamingPipeline {
     routed
       .get(RawTag)
       .setRowSchema(RawSchema)
-      .apply("Append canonical history", configuredRawWriter)
+      .apply("Append deliveries to landing", configuredLandingWriter)
     routed
       .get(DeadLetterTag)
       .setRowSchema(DeadLetterSchema)

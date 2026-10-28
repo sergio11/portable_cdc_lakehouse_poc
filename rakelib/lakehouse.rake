@@ -89,9 +89,16 @@ namespace :lakehouse do
         SELECT snapshot_id, operation, committed_at
           FROM "silver"."orders_current$snapshots" ORDER BY committed_at DESC
       SQL
-      "materialization watermark" => <<~SQL
+      "materialization watermark" => <<~SQL,
         SELECT target_table, last_ingested_at, updated_at
           FROM ops.materialization_state ORDER BY target_table
+      SQL
+      "raw invariants" => <<~SQL
+        SELECT 'raw_rows' AS metric, count(*) AS value FROM raw.order_cdc_events
+        UNION ALL
+        SELECT 'raw_event_ids', count(DISTINCT event_id) FROM raw.order_cdc_events
+        UNION ALL
+        SELECT 'landing_rows', count(*) FROM raw.order_cdc_events_landing
       SQL
     }
 
@@ -105,8 +112,16 @@ namespace :lakehouse do
     end
   end
 
+  desc "Merge landing deliveries into raw, keeping one row per event_id"
+  task :merge do
+    env = Config.load_env!
+    Infra.ensure_iceberg_bucket!(env)
+    Spark.run_file(File.join(SPARK_SQL_DIR, "merge_raw.sql"), env)
+    puts "Raw history merged (spark-sql, catalog pcl)."
+  end
+
   desc "Incrementally merge new raw CDC events into silver.orders_current with Spark"
-  task :materialize do
+  task :materialize => :merge do
     env = Config.load_env!
     Infra.ensure_iceberg_bucket!(env)
     sql = Spark.expand_template(
