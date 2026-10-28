@@ -48,44 +48,27 @@ The trade-off is explicit: more moving parts (Kafka, Flink, Spark, Iceberg, Pola
 ## 🏗️ Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     PG[(PostgreSQL<br/>orders + WAL)] -->|logical decoding| DBZ[Debezium<br/>Kafka Connect]
     DBZ -->|CDC envelopes| K[(Kafka<br/>pcl.public.orders)]
+    K --> BEAM[Beam graph<br/>DirectRunner or FlinkRunner]
 
-    DAG[Dagster<br/>5-minute schedule] -.->|bounded read| DIRECT
-    DAG -.->|incremental MERGE| SPARK
-    DAG -.->|lag and offsets| K
+    BEAM -->|valid events| RAW[(Iceberg raw<br/>order_cdc_events)]
+    BEAM -.->|invalid envelopes| DLQ[(Iceberg ops<br/>cdc_dead_letter)]
 
-    K --> DIRECT[Beam graph<br/>DirectRunner]
-    K --> SUBMIT[Beam job submitter<br/>short-lived container]
-    SUBMIT --> JM[Flink JobManager]
-    JM --> TM[Flink TaskManager<br/>Beam operators execute here]
-
-    DIRECT -->|accepted events| RAW[(Iceberg raw<br/>order_cdc_events)]
-    TM -->|accepted events| RAW
-    DIRECT -->|invalid envelopes| DLQ[(Iceberg ops<br/>cdc_dead_letter)]
-    TM -->|invalid envelopes| DLQ
-
-    RAW --> SPARK[Spark SQL<br/>DDL + incremental MERGE + replay]
-    SPARK -->|watermark| STATE[(Iceberg ops<br/>materialization_state)]
+    RAW --> SPARK[Spark SQL<br/>DDL, MERGE and replay]
     SPARK --> SILVER[(Iceberg silver<br/>orders_current)]
-    SPARK --> REPLAY_TABLE[(silver.orders_current_replay_ID)]
+    SPARK --> STATE[(Iceberg ops<br/>materialization_state)]
 
-    TRINO[Trino<br/>read-only serving] --> RAW
-    TRINO --> DLQ
-    TRINO --> SILVER
-    TRINO --> STATE
-    TRINO --> REPLAY_TABLE
+    RAW --> TRINO[Trino<br/>read-only serving]
+    SILVER --> TRINO
 
-    POL[Apache Polaris<br/>Iceberg REST catalog<br/>Postgres metastore] --- RAW
-    POL --- DLQ
-    POL --- SILVER
-    POL --- REPLAY_TABLE
-    MINIO[(MinIO<br/>S3-compatible object store)] --- RAW
-    MINIO --- DLQ
-    MINIO --- SILVER
-    MINIO --- REPLAY_TABLE
+    DAG[Dagster<br/>every 5 minutes] -.->|lag and offsets| K
+    DAG -.->|bounded read| BEAM
+    DAG -.->|MERGE and replay| SPARK
 ```
+
+Polaris serves the Iceberg catalog and MinIO stores the data files for every table above; Trino also reads `ops.cdc_dead_letter` and `ops.materialization_state`. Replay writes `silver.orders_current_replay_ID`, an isolated table that the diagram omits for clarity.
 
 ### 🔄 Runtime flow
 
@@ -97,34 +80,28 @@ flowchart LR
 6. `lakehouse:replay` and `dagster:replay` drop and recreate an isolated target table with Spark and rebuild it from all raw events or an inclusive LSN range. They do not update the canonical current-state table or the watermark.
 7. Trino only reads: it inspects the Iceberg tables, snapshots, counts, and reconciliation discrepancies. Its access control rejects every write operation.
 
+The scheduled run, from the orchestrator's point of view:
+
 ```mermaid
 sequenceDiagram
     participant G as Dagster
-    participant P as PostgreSQL
-    participant D as Debezium
     participant K as Kafka
-    participant B as Beam graph
-    participant F as Flink TaskManager
-    participant R as Iceberg raw (MinIO)
-    participant X as Spark SQL
-    participant S as Iceberg silver (MinIO)
-    participant T as Trino (read-only)
+    participant B as Beam
+    participant R as Iceberg raw
+    participant X as Spark
+    participant S as Iceberg silver
 
-    G->>K: Lag = end offset - committed offset
-    P->>D: WAL changes
-    D->>K: CDC envelope
-    G->>B: Start a bounded Beam read of the lag
-    K->>B: Read topic
-    Note over B,F: DirectRunner executes locally, or FlinkRunner submits the same graph to Flink
-    B->>R: Append valid canonical event
-    B->>R: Route invalid envelope to ops dead-letter
-    G->>K: Commit offsets after the append
-    G->>X: Start Spark when raw is newer than the watermark
-    X->>R: Read keys changed since the watermark
-    X->>S: Idempotent MERGE / versioned tombstone
-    X->>S: Advance ops.materialization_state
-    T->>S: SELECT for reconciliation and serving
+    G->>K: lag = end offset - committed offset
+    G->>B: bounded read of that lag
+    K->>B: CDC envelopes
+    B->>R: append valid, dead-letter invalid
+    G->>K: commit offsets after the append
+    G->>X: run when raw is newer than the watermark
+    X->>R: read keys changed since the watermark
+    X->>S: MERGE and advance the watermark
 ```
+
+The sequence shows the orchestrator's view of one scheduled run; PostgreSQL and Debezium keep filling Kafka in the background. The unbounded Flink path uses the same Beam graph: the submitter container hands it to the JobManager and TaskManager, which execute it continuously and checkpoint every 10 seconds.
 
 ## 🧰 Technologies and why they were chosen
 
