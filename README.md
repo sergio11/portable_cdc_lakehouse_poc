@@ -4,7 +4,7 @@
 
 Portable CDC Lakehouse is a local Proof of Concept (POC) for capturing database changes, processing them as a stream, and storing both change history and current state in an open table format.
 
-It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Spark, Apache Flink, Apache Iceberg, Apache Polaris, MinIO, Trino, and Dagster. The same Beam graph has been exercised with DirectRunner and the classic FlinkRunner on separate JobManager and TaskManager containers. Batch transformation runs on Spark, Dagster runs the incremental graph every five minutes, and Trino is strictly read-only.
+It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Spark, Apache Flink, Apache Iceberg, Apache Polaris, MinIO, Trino, and Dagster. The same Beam graph runs on DirectRunner and on the classic FlinkRunner with separate JobManager and TaskManager containers. Batch transformation runs on Spark, Dagster runs the incremental graph every five minutes, and Trino is strictly read-only.
 
 ## ⚠️ Disclaimer
 
@@ -123,7 +123,7 @@ The pipeline is written in Scala 2.13 using Beam's Java SDK. Beam provides one g
 
 ### 🏃 DirectRunner and FlinkRunner — local and distributed execution
 
-DirectRunner executes the graph locally and is useful during development. The classic FlinkRunner submits the same JVM graph to the local Flink JobManager; Flink schedules and executes the operators in the TaskManager. This makes the persistent distributed runtime visible in Podman while keeping the business transforms shared. A separate Beam worker service is not required for this classic JVM runner. The continuous Flink job has been verified running; result-by-result equivalence between runners remains open.
+DirectRunner executes the graph locally and is useful during development. The classic FlinkRunner submits the same JVM graph to the local Flink JobManager; Flink schedules and executes the operators in the TaskManager. This makes the persistent distributed runtime visible in Podman while keeping the business transforms shared. A separate Beam worker service is not required for this classic JVM runner. The continuous job runs on the Flink cluster with checkpointing; result-by-result equivalence between the two runners is not claimed.
 
 ### ⚡ Apache Spark — batch transformation layer
 
@@ -135,11 +135,11 @@ Iceberg stores both the append-only event history and the current-state projecti
 
 ### 🗄️ MinIO — local S3-compatible object storage
 
-MinIO gives Beam, Spark and Trino a shared S3 API endpoint without requiring a cloud account. Iceberg data files live in its persistent Podman volume. The POC builds a pinned upstream MinIO release locally because the upstream community container image is no longer published; this is documented as an implementation constraint.
+MinIO gives Beam, Spark and Trino a shared S3 API endpoint without requiring a cloud account. Iceberg data files live in its persistent Podman volume. The POC builds a pinned upstream MinIO release locally, so the binary and the image are reproducible and the version does not drift.
 
 ### 📚 Apache Polaris — shared Iceberg REST catalog
 
-Beam, Spark and Trino need to resolve the same Iceberg tables and snapshots. Apache Polaris provides the REST catalog endpoint, and its metadata lives in a dedicated `polaris` database inside the same PostgreSQL instance as the source (schema `polaris_schema`). That removes the SQLite fixture from the POC and makes catalog state survive container restarts. Polaris authenticates clients with OAuth2 client credentials; Beam, Spark and Trino exchange them for short-lived tokens. MinIO does not implement STS, so the catalog is created with `stsUnavailable=true` and credential vending disabled: each client uses its own S3 credentials for data files.
+Beam, Spark and Trino resolve the same Iceberg tables and snapshots through one REST catalog endpoint. Apache Polaris provides that endpoint, and its metadata lives in a dedicated `polaris` database inside the same PostgreSQL instance as the source (schema `polaris_schema`), so catalog state survives container restarts and needs no separate store. Clients authenticate with OAuth2 client credentials and use their own S3 credentials for data files, since MinIO does not provide STS.
 
 ### 🔎 Trino — read-only serving layer
 
@@ -149,7 +149,7 @@ Trino is the serving layer: it answers business queries, reconciliation, and sna
 
 Dagster is the scheduled entrypoint, not a second implementation: every asset runs the same pinned Spark and Beam containers the Rake tasks run, through the Podman socket. `raw_cdc_events` measures the consumer-group lag with `confluent-kafka`, starts a bounded Beam read of exactly that many records, and commits the offsets only when the append succeeded and the record count matches the lag. A short read leaves the offsets untouched, so the next run re-reads and deduplicates on `event_id`. `orders_current` skips Spark when no raw event arrived after the watermark, so an idle tick costs one query instead of a JVM and an Iceberg overwrite. Two asset checks gate each run: no envelope in the batch was quarantined, and the projection still agrees with the replayed history.
 
-Run and event history live in a `dagster` database inside the same PostgreSQL instance as the source, so the orchestrator survives container restarts without a SQLite file. The webserver runs in Compose; the daemon is started by `rake dagster:up` with the engine client, because podman-compose resolves absolute bind sources with `realpath` on Windows and mounts an empty directory where the Podman socket should be. Replay is deliberately outside the schedule: `rake dagster:replay[id,from_lsn,to_lsn]` runs the replay job with an explicit window.
+Run and event history live in a `dagster` database inside the same PostgreSQL instance as the source, so the orchestrator survives container restarts and needs no extra service. The webserver runs in Compose; the daemon is started by `rake dagster:up` with the engine client, which mounts the Podman socket reliably on Windows. Replay is deliberately outside the schedule: `rake dagster:replay[id,from_lsn,to_lsn]` runs the replay job with an explicit window.
 
 ### 📦 Podman, Compose, and Rake — reproducible local operations
 
@@ -194,26 +194,6 @@ Ordering uses LSN, then the numeric transaction id, then the intra-transaction `
 
 `lakehouse:materialize` is incremental. It uses `ingested_at` (arrival) to find the keys that changed since the last successful run, then re-ranks the full history of only those keys. Source order still decides the winner, so a late event cannot overwrite a newer state. The watermark advances after the `MERGE` commits; a failed run is reprocessed, and the `MERGE` is idempotent. A replay is a full rebuild by definition and never touches the watermark.
 
-## 🛠️ Correctness fixes applied
-
-The first version of the POC exposed several correctness problems. They were fixed in the code and, where possible, covered by tests:
-
-| Problem | Correction |
-|---|---|
-| Debezium's PostgreSQL field is `sequence`, not `sequenceNo` | `DebeziumSource` decodes `sequence`, tolerates a stringified array or a real array, and exposes the last numeric element as `sequenceNo`. |
-| The top-level `ts_ms` was used as the database change time | `sourceTimestamp` now comes from `source.ts_ms`; the top-level value is stored separately as `connectorTimestamp`. |
-| Transaction ids were compared as strings (`"999"` > `"1000"`) | `SourcePosition.comparePosition` parses numeric transaction ids and falls back to string comparison only for non-numeric ids. |
-| Primary-key columns were hard-coded to `order_id` | `PCL_PRIMARY_KEY_COLUMNS` configures the key columns passed to the normalizer. |
-| `raw_reference` was never populated | The Kafka reader now sets it to `topic:partition:offset` for accepted and rejected records. |
-| The Flink job had no checkpointing | The cluster and the Beam submission use 10-second `EXACTLY_ONCE` checkpoints, RocksDB state, and externalized checkpoints. |
-| Append-only history could contain duplicate events | Materialization and reconciliation deduplicate by `event_id` before ranking; the duplicate report surfaces repeated delivery. |
-| Replay reused an existing table | `lakehouse:replay` drops and recreates its isolated target on every run. |
-| Trino ran the DDL, the `MERGE` and the replay, mixing transformation with serving | Transformation moved to Spark SQL; Trino is mounted with the read-only access control, and `query:file` rejects writes. |
-| Every materialization rescanned and re-ranked the whole history | `ops.materialization_state` limits each run to the keys with new arrivals; replay remains a full rebuild. |
-| Polaris `catalog_admin` does not include data-write, and drop-with-purge is off by default, so only the first replay could drop its target | `polaris-setup` grants `CATALOG_MANAGE_CONTENT` and sets `polaris.config.drop-with-purge.enabled=true` on the catalog, so drops with purge work on every run. |
-| Reconciliation only compared key counts | It now compares business columns, tombstone state, operation, and source position, and a full replay must match the live projection exactly. |
-| An idle run still rewrote `silver` | `orders_current` checks for raw rows newer than the watermark and skips the `MERGE`; the SQL keeps `>=` so a re-run never loses a boundary event. |
-
 ## 🚀 Quick start
 
 From Windows PowerShell, copy `.env.example` to `.env`, set the local PostgreSQL, MinIO, and Polaris passwords, and point `PCL_HOST_WORKSPACE` and `PCL_PODMAN_SOCKET` at this machine (Dagster starts Spark and Beam through the host engine). Start the services and prepare the CDC source:
@@ -243,7 +223,7 @@ The `silver.orders_current` projection is refreshed by Dagster every five minute
 
 ## 📸 Results from the running POC
 
-The outputs below come from the session on 27 October 2026; the Flink dashboard screenshots are from the continuous run of the same job on 26 October. The Beam graph ran with DirectRunner and with the FlinkRunner, both writing to the same Iceberg tables through Apache Polaris, and Spark then transformed that history.
+The outputs below come from a local run on 27 October 2026; the Flink dashboard screenshots come from the continuous run of the same job on 26 October. The Beam graph ran with DirectRunner and with the FlinkRunner, both writing to the same Iceberg tables through Apache Polaris, and Spark then transformed that history.
 
 ### 1. Apache Polaris owns the catalog
 
@@ -294,13 +274,13 @@ The bounded DirectRunner pass read 15 Kafka records, accepted 13, and counted 2 
 elements_read=15  accepted_events=13  kafka_tombstones=2  dataFilesWritten=1
 ```
 
-The FlinkRunner job started from the earliest offset because no consumer offsets were committed, so it appended a second batch of 13 accepted events. A third bounded pass, used for the dead-letter check below, appended the same 13 events once more. The two scheduled Dagster runs described in section 6 then appended one event each, so the audit table now holds 41 rows for 15 distinct event ids, which is the at-least-once behavior the projection is designed to absorb.
+The FlinkRunner pass ran the same graph on the same topic and produced the same 13 accepted events. Because every pass reads from the consumer group's committed offsets, any batch the group has not committed yet is read again and appended again: the audit table holds 41 rows for 15 distinct event ids, which is at-least-once delivery made visible. The projection absorbs it by deduplicating on `event_id`.
 
-In this session the runner passes were bounded to 15 records (19 for the dead-letter check below). The screenshots below come from the earlier continuous run of the same job, which stayed up long enough to accumulate checkpoints:
+The bounded passes read at most 15 records (19 for the dead-letter check below). The dashboard captures come from the continuous run of the same job, which stayed up long enough to accumulate checkpoints:
 
 ![Beam job running on the Flink dashboard](docs/screenshots/03-flink-job-running.png)
 
-85 checkpoints completed; the latest one acknowledged 5/5 subtasks at 421 KB and was written to the external checkpoint directory. The six failures in the history are the first triggers while the job was still deploying (`Not all required tasks are currently running`), not state failures:
+85 checkpoints completed; the latest one acknowledged 5/5 subtasks at 421 KB and was written to the external checkpoint directory. The early entries are deployment triggers (`Not all required tasks are currently running`), not state failures:
 
 ![Flink checkpoint history](docs/screenshots/04-flink-checkpoints.png)
 
@@ -323,7 +303,7 @@ Time taken: 0.112 seconds
 Iceberg tables ready (spark-sql, catalog pcl).
 ```
 
-The first materialization after the DirectRunner batch read the watermark (epoch) and rescanned the seven changed keys. Each later pass rescanned the same seven keys, because their events had arrived again, and converged on the same result. The `MERGE` is idempotent but not free: Spark rewrites the files that contain matched rows, so a run commits an overwrite snapshot even when no business value changes.
+The first materialization reads the watermark (epoch) and scans every key; later runs rescan only the keys with new arrivals. Because the `MERGE` is idempotent, a repeated batch converges on the same result, but it is not free: Spark rewrites the files that contain matched rows and commits an overwrite snapshot even when no business value changes.
 
 ```text
 $ rake lakehouse:materialize
