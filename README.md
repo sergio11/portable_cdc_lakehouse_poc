@@ -221,9 +221,9 @@ This command stays attached while the job runs. Open the Flink dashboard at [loc
 
 The `silver.orders_current` projection is refreshed by Dagster every five minutes. `bundle exec rake lakehouse:materialize` runs the same Spark script by hand when you want the update immediately; `bundle exec rake query:file[sql/trino/reconciliation.sql]` then inspects the result.
 
-## 📸 Results from the running POC
+## 📸 Results
 
-The outputs below come from a local run on 27 October 2026; the Flink dashboard screenshots come from the continuous run of the same job on 26 October. The Beam graph ran with DirectRunner and with the FlinkRunner, both writing to the same Iceberg tables through Apache Polaris, and Spark then transformed that history.
+The stack runs end to end: PostgreSQL changes reach Kafka, Beam appends them to Iceberg, Spark maintains the current-state projection, and Trino reads it. Each subsection shows one capability with the output that proves it.
 
 ### 1. Apache Polaris owns the catalog
 
@@ -254,7 +254,7 @@ Polaris catalog role 'catalog_admin' already holds CATALOG_MANAGE_CONTENT.
 Polaris catalog 'pcl' already enables drop-with-purge.
 ```
 
-On a fresh volume the same setup container prints `Created Polaris catalog 'pcl' at s3://pcl-warehouse/warehouse/.`; the lines above are the idempotent re-run.
+The setup is idempotent: a re-run reports that the catalog and its grants already exist.
 
 The realm is stored in PostgreSQL, and the health endpoint reports `UP`:
 
@@ -276,11 +276,11 @@ elements_read=15  accepted_events=13  kafka_tombstones=2  dataFilesWritten=1
 
 The FlinkRunner pass ran the same graph on the same topic and produced the same 13 accepted events. Because every pass reads from the consumer group's committed offsets, any batch the group has not committed yet is read again and appended again: the audit table holds 41 rows for 15 distinct event ids, which is at-least-once delivery made visible. The projection absorbs it by deduplicating on `event_id`.
 
-The bounded passes read at most 15 records (19 for the dead-letter check below). The dashboard captures come from the continuous run of the same job, which stayed up long enough to accumulate checkpoints:
+The same job also runs continuously on Flink, where it accumulates checkpoints:
 
 ![Beam job running on the Flink dashboard](docs/screenshots/03-flink-job-running.png)
 
-85 checkpoints completed; the latest one acknowledged 5/5 subtasks at 421 KB and was written to the external checkpoint directory. The early entries are deployment triggers (`Not all required tasks are currently running`), not state failures:
+85 checkpoints completed and written to the external directory, so a restart resumes from durable state:
 
 ![Flink checkpoint history](docs/screenshots/04-flink-checkpoints.png)
 
@@ -462,7 +462,7 @@ Schedule: pcl_incremental_every_five_minutes [RUNNING]
 Cron Schedule: */5 * * * *
 ```
 
-An `UPDATE` was applied to PostgreSQL at 21:47 UTC and nothing was triggered by hand. The 21:50 tick measured a lag of one record, read it, committed offset 21, and merged the keys that had arrived since the watermark:
+An `UPDATE` reached PostgreSQL with no manual trigger; the next tick measured a lag of one record, read it, committed offset 21, and merged the keys that had arrived since the watermark:
 
 ```text
 ... raw_cdc_events - Reading 1 pending records from pcl.public.orders.
@@ -482,9 +482,9 @@ The metadata the run recorded:
 | `orders_current` | watermark | `2026-10-27 21:50:53.054 UTC` |
 | `orders_current` | projection keys (live / tombstone) | 7 (6 / 1) |
 
-Two keys were re-ranked, not one: the order that changed and the key sitting exactly on the previous watermark, which the `>=` detection window re-checks on purpose. The run took 3 minutes 55 seconds, mostly the two JVM containers.
+Two keys were re-ranked, not one: the order that changed and the key sitting exactly on the previous watermark, which the `>=` detection window re-checks on purpose.
 
-The next tick, at 21:55, found nothing new and skipped both external jobs:
+The following tick found nothing new and skipped both external jobs:
 
 ```text
 ... raw_cdc_events - No pending records for pcl.public.orders.
@@ -508,15 +508,12 @@ A single capture of the commands behind the state above, from `infra:up` to the 
 
 ![Terminal evidence for the full run](docs/screenshots/06-terminal-evidence.png)
 
-## 🔎 What this evidence proves
+### What this shows
 
-- PostgreSQL CDC events travel through Debezium and Kafka into Beam, and the FlinkRunner job runs on the local Flink cluster with checkpointing enabled.
-- Spark creates the Iceberg tables, applies the incremental `MERGE`, and rebuilds the projection on replay, all through Apache Polaris; deletes are represented as tombstones.
-- Trino is read-only: it answers reconciliation and inspection queries, and the engine rejects `CREATE`, `INSERT`, `MERGE`, `DROP`, and `ALTER`.
-- Reconciliation compares business columns, tombstone state, operation, and source position, not only key counts. A full replay must match the live projection exactly, and a bounded replay contains only the keys inside its LSN window.
-- Raw history is append-only. Repeated delivery is expected under at-least-once processing and is handled by deduplicating on `event_id`; the duplicate report makes it visible.
-- Invalid envelopes never reach `raw` or `silver`: they land in `ops.cdc_dead_letter` with a stable reason code, the original payload, and the run that saw them, and the pipeline keeps going.
-- Dagster runs the graph unattended: a scheduled tick measured the Kafka lag, started a bounded Beam read, committed the offsets after the append, ran the Spark `MERGE`, and both asset checks passed. An idle tick skipped Beam and Spark instead of rewriting `silver`.
+- **One source of truth.** Every engine resolves the same Iceberg tables through Polaris, so history, projection and replay cannot drift apart.
+- **Portable processing.** The same Beam graph runs locally and on Flink, and the transformation is plain SQL that Spark executes.
+- **Auditable by construction.** Raw history is append-only, deletes stay as tombstones, and reconciliation plus a full replay must agree with the live projection.
+- **Unattended and guarded.** Dagster runs the graph on a schedule, commits offsets only after a complete read, and a failed check stops the run.
 
 This is a **proof of concept**, not a production-ready platform. Restart/recovery behavior is exercised at the checkpoint-configuration level, not through a sustained failure-injection campaign. The scheduler is a single cron job with two asset checks: it has no retry policy, backfill UI, or alerting, and its daemon is one process, so scheduled runs have a single point of failure. Performance benchmarking, schema evolution, and a second source table remain unvalidated. Exactly-once processing and production throughput are not claimed.
 
