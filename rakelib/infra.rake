@@ -237,7 +237,10 @@ module Trino
 
   module_function
 
-  def execute(sql, env = Config.load_env!)
+  # `user` selects the Trino identity. Normal queries run as `pcl` (read-only);
+  # only the serving-view DDL runs as `pcl-provisioner`, which the file-based
+  # access control allows to own `serving.orders_current`.
+  def execute(sql, env = Config.load_env!, user: "pcl")
     base = "http://localhost:#{env.fetch('PCL_TRINO_PORT')}/v1/statement"
     uri = URI(base)
     results = []
@@ -247,14 +250,14 @@ module Trino
     loop do
       if next_uri.nil?
         request = Net::HTTP::Post.new(uri)
-        request["X-Trino-User"] = "pcl"
+        request["X-Trino-User"] = user
         request["X-Trino-Source"] = "pcl-rake"
         request["X-Trino-Catalog"] = "iceberg"
         request["Content-Type"] = "text/plain; charset=utf-8"
         request.body = sql
       else
         request = Net::HTTP::Get.new(URI(next_uri))
-        request["X-Trino-User"] = "pcl"
+        request["X-Trino-User"] = user
         request["X-Trino-Source"] = "pcl-rake"
         request["X-Trino-Catalog"] = "iceberg"
       end
@@ -286,12 +289,12 @@ module Trino
     { "query_id" => query_id, "data" => results }
   end
 
-  def execute_file(path, env = Config.load_env!)
+  def execute_file(path, env = Config.load_env!, user: "pcl")
     results = []
     query_id = nil
 
     split_statements(File.read(path)).each do |sql|
-      result = execute(sql, env)
+      result = execute(sql, env, user: user)
       query_id = result["query_id"]
       results.concat(result["data"])
     end
@@ -314,7 +317,8 @@ module Trino
       abort(<<~MSG)
         query:file is read-only and cannot run #{keyword.empty? ? 'an empty statement' : keyword}.
         Allowed: #{READ_ONLY_KEYWORDS.join(', ')}.
-        Writes belong to Spark: rake lakehouse:init, lakehouse:merge, lakehouse:materialize, lakehouse:replay.
+        Table writes belong to Spark: rake lakehouse:init, lakehouse:merge, lakehouse:materialize, lakehouse:replay.
+        The serving view belongs to Trino: rake lakehouse:serve.
       MSG
     end
   end
@@ -514,6 +518,7 @@ namespace :infra do
     puts "  Polaris  http://localhost:#{env.fetch('PCL_ICEBERG_CATALOG_PORT')}/api/catalog"
     puts "  Polaris health  http://localhost:#{env.fetch('PCL_POLARIS_HEALTH_PORT', '8182')}/q/health"
     puts "  Dagster  #{Dagster.ui_url(env)}"
+    puts "  Speed layer  rake pipeline:speed:up  (Flink, continuous)"
   end
 
   desc "Stop the stack, keeping volumes (the CDC history is preserved)"
@@ -522,7 +527,7 @@ namespace :infra do
     # Not part of the Compose file (see Dagster.start_daemon!); stop it first so
     # no run is mid-flight when the services it talks to disappear.
     Dagster.stop_daemon!
-    Infra.compose("--profile", "flink", "down")
+    Infra.compose("--profile", "flink", "--profile", "speed", "down")
   end
 
   desc "Show container status"
@@ -552,7 +557,7 @@ namespace :infra do
 
     Config.load_env!
     Dagster.stop_daemon!
-    Infra.compose("--profile", "flink", "down", "-v")
+    Infra.compose("--profile", "flink", "--profile", "speed", "down", "-v")
     puts "Volumes removed. `rake infra:up` rebuilds an empty environment."
   end
 end

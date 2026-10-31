@@ -41,6 +41,11 @@ module Config
   MINIO_ENDPOINT = "http://minio:9000"
   TRINO_CATALOG_TEMPLATE = File.join(ROOT, "infra", "trino", "etc", "catalog", "iceberg.properties.template")
   TRINO_CATALOG_OUTPUT = File.join(ROOT, ".local", "trino", "catalog", "iceberg.properties")
+  # The serving view stores its SQL with the Spark catalog name (`pcl`). Trino
+  # needs a catalog with that exact name to resolve the view body, so the same
+  # Polaris catalog is registered twice: `iceberg` for existing queries and
+  # `pcl` for Iceberg views created by Spark.
+  TRINO_CATALOG_OUTPUT_PCL = File.join(ROOT, ".local", "trino", "catalog", "pcl.properties")
   PIPELINE_ENV_OUTPUT = File.join(ROOT, ".local", "pipeline.env")
 
   # --- Spark (batch transformation layer) ------------------------------------
@@ -105,7 +110,9 @@ module Config
     replacements.each { |key, value| template = template.gsub("__#{key}__", value) }
 
     FileUtils.mkdir_p(File.dirname(TRINO_CATALOG_OUTPUT))
-    File.open(TRINO_CATALOG_OUTPUT, "w", 0o600) { |file| file.write(template) }
+    [TRINO_CATALOG_OUTPUT, TRINO_CATALOG_OUTPUT_PCL].each do |output|
+      File.open(output, "w", 0o600) { |file| file.write(template) }
+    end
   end
 
   # Create a one-run env file for the Beam container so credentials are never

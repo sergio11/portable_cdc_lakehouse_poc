@@ -1,0 +1,42 @@
+{
+  "catalogs": [
+    {
+      "catalog": "(iceberg|pcl)",
+      "allow": "all"
+    },
+    {
+      "catalog": "system",
+      "allow": "read-only"
+    }
+  ],
+  "schemas": [
+    {
+      "user": "pcl-provisioner",
+      "catalog": "(iceberg|pcl)",
+      "schema": "serving",
+      "owner": true
+    }
+  ],
+  "tables": [
+    {
+      "user": "pcl-provisioner",
+      "catalog": "(iceberg|pcl)",
+      "schema": "serving",
+      "table": "orders_current",
+      "privileges": ["SELECT", "OWNERSHIP"]
+    },
+    {
+      "user": "pcl-provisioner",
+      "catalog": "(iceberg|pcl)",
+      "schema": "(silver|speed)",
+      "table": ".*",
+      "privileges": ["SELECT", "GRANT_SELECT"]
+    },
+    {
+      "catalog": "(iceberg|pcl)",
+      "schema": ".*",
+      "table": ".*",
+      "privileges": ["SELECT"]
+    }
+  ]
+}

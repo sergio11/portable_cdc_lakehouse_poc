@@ -104,7 +104,8 @@ def spark_metrics(output: str) -> dict[str, int]:
     metrics: dict[str, int] = {}
     pattern = re.compile(
         r"^(changed_keys|projected_keys|landing_rows|landing_events|"
-        r"landing_duplicates|raw_rows|raw_event_ids|landing_remaining)\s+(\d+)$"
+        r"landing_duplicates|raw_rows|raw_event_ids|landing_remaining|"
+        r"speed_rows|speed_event_ids|speed_stale)\s+(\d+)$"
     )
     for line in output.splitlines():
         match = pattern.match(line.strip())
@@ -146,6 +147,12 @@ def run_beam(podman: Podman, max_records: int) -> dict[str, int]:
         "PCL_PRIMARY_KEY_COLUMNS": env("PCL_PRIMARY_KEY_COLUMNS", "order_id"),
         "PCL_WRITE_FREQUENCY_SECONDS": env("PCL_WRITE_FREQUENCY_SECONDS", "10"),
         "PCL_MAX_RECORDS": str(max_records),
+        # The batch layer owns its own consumer group and leaves offsets to
+        # Dagster, which commits them only after the canonical merge.
+        "PCL_PIPELINE_LAYER": "batch",
+        "PCL_CONSUMER_GROUP": f"pcl-batch-{env('PCL_SOURCE_ID', 'pg-local-1')}",
+        "PCL_TARGET_TABLE": "raw.order_cdc_events_landing",
+        "PCL_COMMIT_OFFSETS": "false",
     }
 
     # Credentials travel in a file, never on the command line.

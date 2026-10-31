@@ -7,6 +7,11 @@
 -- it with one row per event_id, so the history is the audit trail and the
 -- projection is the thing under test. A duplicate in raw is a failed ingest,
 -- not an expected condition; section 2 asserts that invariant.
+--
+-- In the lambda layout, speed.order_cdc_events is a real-time buffer that may
+-- contain duplicates, and serving.orders_current is the merged view. Sections
+-- 9 and 10 assert the speed layer is compacted and the serving view is never
+-- older than the batch view.
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
@@ -168,3 +173,24 @@ SELECT reason_code, count(*) AS rejected_events
   FROM ops.cdc_dead_letter
  GROUP BY reason_code
  ORDER BY reason_code;
+
+-- ---------------------------------------------------------------------------
+-- 9. Speed layer health. Duplicates are expected in this buffer; stale rows
+--    (already canonical in raw) must be 0 after compaction.
+-- ---------------------------------------------------------------------------
+SELECT count(*)                                  AS speed_rows,
+       count(DISTINCT event_id)                  AS speed_event_ids,
+       count(*) - count(DISTINCT event_id)       AS speed_duplicates,
+       count_if(event_id IN (SELECT event_id FROM raw.order_cdc_events)) AS speed_stale
+  FROM speed.order_cdc_events;
+
+-- ---------------------------------------------------------------------------
+-- 10. Serving lag. Batch is authoritative, so no key may be older in the
+--     serving view than in the batch view. A speed row may legitimately be
+--     newer; that is the lambda merge working.
+-- ---------------------------------------------------------------------------
+SELECT count(*) AS keys_lagging_batch
+  FROM serving.orders_current s
+  JOIN silver.orders_current b
+    ON b.order_id = s.order_id
+ WHERE b.last_lsn > s.last_lsn;

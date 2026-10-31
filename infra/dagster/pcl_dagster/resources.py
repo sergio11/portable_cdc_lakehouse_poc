@@ -1,8 +1,9 @@
 """Clients for the services the orchestrator drives.
 
 Each resource wraps one external system and does what the equivalent Rake task
-does. Nothing here writes to Iceberg: DDL, MERGE and replay belong to Spark, and
-Trino stays read-only, so the layer boundary holds no matter who starts the work.
+does. Nothing here writes Iceberg data: DDL, MERGE and replay belong to Spark.
+Trino reads the lakehouse and owns exactly one object, the serving view
+definition, because Iceberg views are dialect-specific.
 """
 
 import subprocess
@@ -75,16 +76,29 @@ class Podman(ConfigurableResource):
 
 
 class Trino(ConfigurableResource):
-    """Read-only SQL client for the serving layer."""
+    """SQL client for the serving layer.
+
+    Normal queries run as `pcl` and are read-only. The serving-view DDL runs as
+    `pcl-provisioner`, the only identity the file-based access control allows to
+    own `serving.orders_current`; Iceberg stores one SQL dialect per view, so
+    Trino must be the engine that writes it.
+    """
 
     url: str = "http://trino:8080"
     user: str = "pcl"
+    provisioner_user: str = "pcl-provisioner"
     source: str = "pcl-dagster"
     catalog: str = "iceberg"
 
     def query(self, sql: str) -> list[list[str]]:
+        return self._execute(sql, self.user)
+
+    def provision(self, sql: str) -> list[list[str]]:
+        return self._execute(sql, self.provisioner_user)
+
+    def _execute(self, sql: str, user: str) -> list[list[str]]:
         headers = {
-            "X-Trino-User": self.user,
+            "X-Trino-User": user,
             "X-Trino-Source": self.source,
             "X-Trino-Catalog": self.catalog,
             "Content-Type": "text/plain; charset=utf-8",

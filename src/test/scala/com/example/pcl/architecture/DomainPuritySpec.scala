@@ -69,6 +69,33 @@ class DomainPuritySpec extends AnyFlatSpec with Matchers {
 
   it should "build settings when both variables are present" in {
     val result = PclSettings.fromEnv(Map("PCL_RUN_ID" -> "run-1", "PCL_SOURCE_ID" -> "pg-1"))
-    result shouldBe Right(PclSettings(runId = "run-1", sourceId = "pg-1"))
+    result shouldBe Right(
+      PclSettings(runId = "run-1", sourceId = "pg-1", consumerGroup = "pcl-batch-pg-1")
+    )
+  }
+
+  it should "keep the speed layer on its own consumer group and target table" in {
+    val result = PclSettings.fromEnv(
+      Map(
+        "PCL_RUN_ID"         -> "speed",
+        "PCL_SOURCE_ID"      -> "pg-1",
+        "PCL_PIPELINE_LAYER" -> "speed",
+        "PCL_CONSUMER_GROUP" -> "pcl-speed-pg-1",
+        "PCL_TARGET_TABLE"   -> "speed.order_cdc_events",
+        "PCL_COMMIT_OFFSETS" -> "true"
+      )
+    )
+
+    result.map(settings =>
+      (settings.pipelineLayer, settings.consumerGroup, settings.targetTable, settings.commitOffsets)
+    ) shouldBe
+      Right(("speed", "pcl-speed-pg-1", "speed.order_cdc_events", true))
+  }
+
+  it should "reject a target table without a namespace" in {
+    val result = PclSettings.fromEnv(
+      Map("PCL_RUN_ID" -> "run-1", "PCL_SOURCE_ID" -> "pg-1", "PCL_TARGET_TABLE" -> "landing")
+    )
+    result shouldBe Left(PclSettings.InvalidTargetTable)
   }
 }

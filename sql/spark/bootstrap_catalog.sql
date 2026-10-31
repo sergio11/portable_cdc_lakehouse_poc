@@ -3,6 +3,8 @@
 
 CREATE NAMESPACE IF NOT EXISTS pcl.raw;
 CREATE NAMESPACE IF NOT EXISTS pcl.silver;
+CREATE NAMESPACE IF NOT EXISTS pcl.speed;
+CREATE NAMESPACE IF NOT EXISTS pcl.serving;
 CREATE NAMESPACE IF NOT EXISTS pcl.ops;
 
 -- Canonical history: one row per event_id, written only by the merge in
@@ -29,8 +31,9 @@ CREATE TABLE IF NOT EXISTS pcl.raw.order_cdc_events (
 ) USING iceberg
 TBLPROPERTIES ('format-version' = '2');
 
--- Landing buffer: Beam appends every delivery here, duplicates included. Spark
--- merges it into canonical raw and releases the deliveries raw already holds.
+-- Batch landing buffer: the batch Beam job appends every delivery here,
+-- duplicates included. Spark merges it into canonical raw and releases the
+-- deliveries raw already holds.
 CREATE TABLE IF NOT EXISTS pcl.raw.order_cdc_events_landing (
     event_id               STRING         NOT NULL,
     source_id              STRING         NOT NULL,
@@ -53,6 +56,34 @@ CREATE TABLE IF NOT EXISTS pcl.raw.order_cdc_events_landing (
 ) USING iceberg
 TBLPROPERTIES ('format-version' = '2');
 
+-- Speed layer output: the continuous Flink job appends every accepted delivery
+-- here with its own consumer group and checkpoints. It is not canonical: the
+-- serving view deduplicates it and Spark releases the events canonical raw
+-- already holds. Losing this table costs freshness, never history.
+CREATE TABLE IF NOT EXISTS pcl.speed.order_cdc_events (
+    event_id               STRING         NOT NULL,
+    source_id              STRING         NOT NULL,
+    schema_name            STRING         NOT NULL,
+    table_name             STRING         NOT NULL,
+    primary_key            STRING         NOT NULL,
+    operation              STRING         NOT NULL,
+    lsn                    BIGINT         NOT NULL,
+    tx_id                  STRING,
+    seq_no                 BIGINT,
+    source_timestamp       TIMESTAMP,
+    connector_timestamp    TIMESTAMP,
+    is_snapshot            BOOLEAN        NOT NULL,
+    before_image           MAP<STRING, STRING>,
+    after_image            MAP<STRING, STRING>,
+    schema_version         INT            NOT NULL,
+    raw_reference          STRING,
+    batch_id               STRING         NOT NULL,
+    ingested_at            TIMESTAMP      NOT NULL
+) USING iceberg
+TBLPROPERTIES ('format-version' = '2');
+
+-- Batch view: one row per order, built only from canonical raw. This is the
+-- authoritative side of the serving merge.
 CREATE TABLE IF NOT EXISTS pcl.silver.orders_current (
     order_id       BIGINT         NOT NULL,
     customer_id    BIGINT,

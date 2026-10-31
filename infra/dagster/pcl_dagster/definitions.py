@@ -1,9 +1,11 @@
-"""Dagster entrypoint: assets, checks, the incremental schedule and replay.
+"""Dagster entrypoint: the batch layer of a lambda architecture.
 
-The schedule materialises the graph every five minutes. Each run is incremental:
-the ingestion step only reads what is pending in Kafka, merges those deliveries
-into canonical raw by event_id, and the transformation step only merges what
-arrived since the watermark.
+The schedule materialises the batch graph every five minutes. Each run is
+incremental: the ingestion step reads what is pending in Kafka with the batch
+consumer group, merges those deliveries into canonical raw by event_id, the
+transformation step only merges what arrived since the watermark, and the
+serving step compacts speed deliveries that batch now owns and refreshes the
+query-time merge. The continuous speed layer runs outside this graph.
 """
 
 from dagster import (
@@ -23,15 +25,25 @@ from .assets import (
     projection_matches_history,
     raw_cdc_events,
     raw_events_unique,
+    serving_orders,
+    serving_prefers_batch,
+    speed_compaction,
+    speed_fully_compacted,
 )
 from .config import env
 from .resources import Kafka, Podman, Trino
 
 incremental_job = define_asset_job(
     name="pcl_incremental",
-    selection=AssetSelection.assets(raw_cdc_events, orders_current).upstream()
+    selection=AssetSelection.assets(
+        raw_cdc_events, orders_current, speed_compaction, serving_orders
+    ).upstream()
     | AssetSelection.checks(
-        batch_fully_accounted, raw_events_unique, projection_matches_history
+        batch_fully_accounted,
+        raw_events_unique,
+        projection_matches_history,
+        speed_fully_compacted,
+        serving_prefers_batch,
     ),
 )
 
@@ -46,9 +58,17 @@ defs = Definitions(
         lakehouse_tables,
         raw_cdc_events,
         orders_current,
+        speed_compaction,
+        serving_orders,
         orders_current_replay,
     ],
-    asset_checks=[batch_fully_accounted, raw_events_unique, projection_matches_history],
+    asset_checks=[
+        batch_fully_accounted,
+        raw_events_unique,
+        projection_matches_history,
+        speed_fully_compacted,
+        serving_prefers_batch,
+    ],
     jobs=[incremental_job, replay_job],
     schedules=[
         ScheduleDefinition(
@@ -74,7 +94,7 @@ defs = Definitions(
         "kafka": Kafka(
             bootstrap=env("PCL_KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
             topic=env("PCL_CDC_TOPIC", "pcl.public.orders"),
-            group_id=f"pcl-{env('PCL_SOURCE_ID', 'pg-local-1')}",
+            group_id=f"pcl-batch-{env('PCL_SOURCE_ID', 'pg-local-1')}",
         ),
     },
 )

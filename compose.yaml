@@ -221,10 +221,12 @@ services:
     volumes:
       # Generated from the local .env; contains credentials and is gitignored.
       - ./.local/trino/catalog:/etc/trino/catalog:ro
-      # Trino is the serving layer only. The built-in read-only access control
-      # rejects INSERT, CREATE, MERGE, DROP and ALTER even if a query reaches it,
-      # so the layer boundary is enforced by the engine, not just by Rake.
+      # Trino is the serving layer only. The file-based access control grants
+      # SELECT on the lakehouse catalogs to every client and OWNERSHIP of the
+      # serving view to `pcl-provisioner` alone, so data writes are rejected by
+      # the engine and only the view definition can be managed from Trino.
       - ./infra/trino/etc/access-control.properties:/etc/trino/access-control.properties:ro
+      - ./infra/trino/etc/access-control-rules.json:/etc/trino/access-control-rules.json:ro
       - trino_data:/var/lib/trino/data
     ports:
       - "127.0.0.1:${PCL_TRINO_PORT}:8080"
@@ -327,6 +329,45 @@ services:
       - "127.0.0.1:${PCL_FLINK_WEB_PORT:-8081}:8081"
     profiles: ["flink"]
 
+  # --- Lambda speed layer -----------------------------------------------------
+  #
+  # The speed job is deliberately not part of the Dagster graph: it runs
+  # continuously on Flink, with its own consumer group and checkpointed Kafka
+  # offsets, and appends to `speed.order_cdc_events`. It never writes canonical
+  # `raw`; Spark owns that boundary. Restarting it replays from the last
+  # checkpoint/committed offset, and the serving view absorbs duplicates.
+  pipeline-speed:
+    image: ${PCL_SBT_IMAGE:-docker.io/sbtscala/scala-sbt:eclipse-temurin-21.0.12_8_1.13.0_2.13.18}
+    container_name: pcl-pipeline-speed
+    depends_on:
+      kafka:
+        condition: service_healthy
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+    env_file: .env
+    environment:
+      PCL_RUN_ID: speed
+      PCL_PIPELINE_LAYER: speed
+      PCL_CONSUMER_GROUP: pcl-speed-${PCL_SOURCE_ID}
+      PCL_TARGET_TABLE: speed.order_cdc_events
+      PCL_COMMIT_OFFSETS: "true"
+      PCL_MAX_RECORDS: "0"
+    volumes:
+      - pcl-build-target:/workspace/target:ro
+    working_dir: /workspace
+    entrypoint: ["java", "-jar", "/workspace/target/scala-2.13/pcl-pipeline.jar"]
+    command:
+      - --runner=org.apache.beam.runners.flink.FlinkRunner
+      - --flinkMaster=flink-jobmanager:8081
+      - --checkpointingInterval=10000
+      - --checkpointingMode=EXACTLY_ONCE
+      - --externalizedCheckpointsEnabled=true
+      - --retainExternalizedCheckpointsOnCancellation=true
+    restart: unless-stopped
+    profiles: ["speed"]
+
   flink-taskmanager:
     image: docker.io/library/flink:2.2.1-java21
     container_name: pcl-flink-taskmanager
@@ -357,3 +398,7 @@ volumes:
   trino_data:
   flink_checkpoints:
   dagster_home:
+  # Built by `rake assembly`; the speed job mounts the same artifact the batch
+  # path runs, so there is one implementation of the Beam graph.
+  pcl-build-target:
+    external: true

@@ -1,12 +1,18 @@
-"""The lakehouse graph.
+"""The lakehouse graph: the batch layer of a lambda architecture.
 
     debezium_connector ─┐
-    lakehouse_tables ───┴─> raw_cdc_events ──> orders_current ──> checks
+    lakehouse_tables ───┴─> raw_cdc_events ──> orders_current ──> speed_compaction ──> serving_orders
 
-`raw_cdc_events` lands deliveries and merges them into canonical raw by event_id;
-`orders_current` materializes the projection. Every step is idempotent, so a
-retry or an overlapping tick cannot corrupt the tables. Replay is deliberately
-outside the scheduled graph: it is an explicit request with its own window.
+`raw_cdc_events` lands batch deliveries and merges them into canonical raw by
+event_id; `orders_current` materializes the authoritative batch view;
+`speed_compaction` releases speed deliveries that batch already owns; and
+`serving_orders` recreates the query-time merge of batch and speed.
+
+The speed layer is not here: `pipeline-speed` runs continuously on Flink with
+its own consumer group and checkpointed offsets. Every batch step is idempotent,
+so a retry or an overlapping tick cannot corrupt the tables. Replay is
+deliberately outside the scheduled graph: it is an explicit request with its
+own window.
 """
 
 import re
@@ -37,6 +43,7 @@ EXPECTED_TABLES = (
     ("raw", "order_cdc_events"),
     ("raw", "order_cdc_events_landing"),
     ("silver", "orders_current"),
+    ("speed", "order_cdc_events"),
     ("ops", "materialization_state"),
     ("ops", "cdc_dead_letter"),
 )
@@ -49,16 +56,26 @@ def debezium_connector(context: AssetExecutionContext) -> dict[str, str]:
     return status
 
 
-@asset(group_name="lakehouse", description="Creates the Iceberg schemas and tables when missing.")
+@asset(
+    group_name="lakehouse",
+    description="Creates the Iceberg schemas, tables and serving view when missing.",
+)
 def lakehouse_tables(context: AssetExecutionContext, trino: Trino, podman: Podman) -> dict[str, int]:
     present = {
         (schema, table)
         for schema, table in trino.query(
             "SELECT table_schema, table_name FROM iceberg.information_schema.tables "
-            "WHERE table_schema IN ('raw', 'silver', 'ops')"
+            "WHERE table_schema IN ('raw', 'silver', 'speed', 'serving', 'ops')"
         )
     }
     missing = [table for table in EXPECTED_TABLES if table not in present]
+    try:
+        # A view is not guaranteed to appear in information_schema.tables, so
+        # probe it directly; this also proves Trino can resolve its body.
+        trino.query("SELECT 1 FROM iceberg.serving.orders_current LIMIT 0")
+        view_missing = False
+    except Exception:
+        view_missing = True
 
     if missing:
         # DDL is idempotent, but it costs a Spark container: only pay for it when
@@ -69,7 +86,15 @@ def lakehouse_tables(context: AssetExecutionContext, trino: Trino, podman: Podma
     else:
         context.log.info("All %d Iceberg tables are present.", len(EXPECTED_TABLES))
 
-    context.add_output_metadata({"missing_tables": len(missing)})
+    if missing or view_missing:
+        # Iceberg stores one SQL dialect per view and Trino rejects Spark's, so
+        # the view definition is written by Trino through the provisioning user.
+        view = (WORKSPACE / "sql/serving/serving_view.sql").read_text(encoding="utf-8")
+        trino.provision(view)
+
+    context.add_output_metadata(
+        {"missing_tables": len(missing), "serving_view_missing": view_missing}
+    )
     return {"missing_tables": len(missing)}
 
 
@@ -229,6 +254,46 @@ def orders_current(context: AssetExecutionContext, trino: Trino, podman: Podman)
     return {"pending": pending, "keys": keys, "live": live}
 
 
+@asset(
+    deps=[orders_current],
+    group_name="transform",
+    description="Releases speed-layer deliveries whose event is already canonical in raw.",
+)
+def speed_compaction(
+    context: AssetExecutionContext, trino: Trino, podman: Podman
+) -> dict[str, int]:
+    speed_rows = int(trino.scalar("SELECT count(*) FROM iceberg.speed.order_cdc_events") or 0)
+    if speed_rows == 0:
+        context.log.info("Speed layer is empty; skipping compaction.")
+        return {"speed_rows": 0}
+    sql = (WORKSPACE / "sql/spark/compact_speed.sql").read_text(encoding="utf-8")
+    metrics = spark_metrics(run_spark(podman, sql, "compact_speed"))
+    context.add_output_metadata(metrics)
+    return metrics
+
+
+@asset(
+    deps=[speed_compaction],
+    group_name="serving",
+    description="Recreates the query-time merge of the batch and speed layers.",
+)
+def serving_orders(context: AssetExecutionContext, trino: Trino) -> dict[str, int]:
+    # A view is query-time logic, not a materialization: recreating it on every
+    # tick would pay a Trino round-trip for nothing. Only pay when it is absent;
+    # `rake lakehouse:serve` refreshes it after a definition change.
+    try:
+        keys = int(trino.scalar("SELECT count(*) FROM iceberg.serving.orders_current") or 0)
+        context.log.info("Serving view already exists; no refresh needed.")
+        context.add_output_metadata({"serving_keys": keys, "recreated": False})
+        return {"serving_keys": keys}
+    except Exception:
+        sql = (WORKSPACE / "sql/serving/serving_view.sql").read_text(encoding="utf-8")
+        trino.provision(sql)
+        keys = int(trino.scalar("SELECT count(*) FROM iceberg.serving.orders_current") or 0)
+        context.add_output_metadata({"serving_keys": keys, "recreated": True})
+        return {"serving_keys": keys}
+
+
 @asset_check(
     asset=raw_cdc_events,
     blocking=True,
@@ -298,6 +363,51 @@ def projection_matches_history(trino: Trino) -> AssetCheckResult:
         passed=mismatches == 0,
         metadata={"mismatched_keys": mismatches},
         description=f"{mismatches} keys disagree with the history.",
+    )
+
+
+@asset_check(
+    asset=serving_orders,
+    blocking=True,
+    description="No speed delivery is already canonical in raw.",
+)
+def speed_fully_compacted(trino: Trino) -> AssetCheckResult:
+    stale = int(
+        trino.scalar(
+            """SELECT count(*)
+                 FROM iceberg.speed.order_cdc_events s
+                 JOIN iceberg.raw.order_cdc_events r
+                   ON r.event_id = s.event_id"""
+        )
+        or 0
+    )
+    return AssetCheckResult(
+        passed=stale == 0,
+        metadata={"stale_speed_rows": stale},
+        description=f"{stale} speed rows are already canonical in raw.",
+    )
+
+
+@asset_check(
+    asset=serving_orders,
+    blocking=True,
+    description="Whenever batch is strictly newer, the serving view already reflects it.",
+)
+def serving_prefers_batch(trino: Trino) -> AssetCheckResult:
+    lagging = int(
+        trino.scalar(
+            """SELECT count(*)
+                 FROM iceberg.serving.orders_current s
+                 JOIN iceberg.silver.orders_current b
+                   ON b.order_id = s.order_id
+                WHERE b.last_lsn > s.last_lsn"""
+        )
+        or 0
+    )
+    return AssetCheckResult(
+        passed=lagging == 0,
+        metadata={"keys_lagging_batch": lagging},
+        description=f"{lagging} serving keys are older than the batch view.",
     )
 
 

@@ -16,14 +16,26 @@ final case class PclSettings(
     s3SecretKey: String = "",
     writeFrequencySeconds: Long = 10L,
     maxRecords: Long = 0L,
-    primaryKeyColumns: List[String] = List("order_id")
+    primaryKeyColumns: List[String] = List("order_id"),
+    pipelineLayer: String = "batch",
+    consumerGroup: String = "",
+    targetTable: String = "raw.order_cdc_events_landing",
+    commitOffsets: Boolean = false
 )
 
 object PclSettings {
 
   /** Reason codes for configuration problems, mirroring the dead-letter vocabulary. */
-  val MissingRunId    = "CONFIG_MISSING_RUN_ID"
-  val MissingSourceId = "CONFIG_MISSING_SOURCE_ID"
+  val MissingRunId       = "CONFIG_MISSING_RUN_ID"
+  val MissingSourceId    = "CONFIG_MISSING_SOURCE_ID"
+  val InvalidTargetTable = "CONFIG_INVALID_TARGET_TABLE"
+
+  /** Iceberg needs a namespace and a table name; reject a bare table before the pipeline starts. */
+  private def validTargetTable(name: String): Either[String, String] = {
+    val parts = name.split('.').toList
+    if (parts.length >= 2 && parts.forall(_.nonEmpty)) Right(name)
+    else Left(InvalidTargetTable)
+  }
 
   /** Build settings from the process environment. Returns a Left with a reason code rather than
     * throwing, so callers decide how to surface misconfiguration.
@@ -32,6 +44,7 @@ object PclSettings {
     for {
       runId    <- env.get("PCL_RUN_ID").toRight(MissingRunId)
       sourceId <- env.get("PCL_SOURCE_ID").toRight(MissingSourceId)
+      target <- validTargetTable(env.getOrElse("PCL_TARGET_TABLE", "raw.order_cdc_events_landing"))
     } yield PclSettings(
       runId = runId,
       sourceId = sourceId,
@@ -53,6 +66,10 @@ object PclSettings {
         .get("PCL_PRIMARY_KEY_COLUMNS")
         .map(_.split(",").iterator.map(_.trim).filter(_.nonEmpty).toList)
         .filter(_.nonEmpty)
-        .getOrElse(List("order_id"))
+        .getOrElse(List("order_id")),
+      pipelineLayer = env.getOrElse("PCL_PIPELINE_LAYER", "batch"),
+      consumerGroup = env.getOrElse("PCL_CONSUMER_GROUP", s"pcl-batch-$sourceId"),
+      targetTable = target,
+      commitOffsets = env.get("PCL_COMMIT_OFFSETS").exists(_.equalsIgnoreCase("true"))
     )
 }

@@ -92,7 +92,7 @@ object CdcStreamingPipeline {
 
         val pipeline = build(options, settings)
         println(
-          s"""{"component":"CdcStreamingPipeline","run_id":"${settings.runId}","source_id":"${settings.sourceId}","topic":"${settings.cdcTopic}","status":"running"}"""
+          s"""{"component":"CdcStreamingPipeline","run_id":"${settings.runId}","layer":"${settings.pipelineLayer}","target":"${settings.targetTable}","source_id":"${settings.sourceId}","topic":"${settings.cdcTopic}","status":"running"}"""
         )
         val result = pipeline.run()
         result.waitUntilFinish()
@@ -124,7 +124,7 @@ object CdcStreamingPipeline {
       .withConsumerConfigUpdates(
         java.util.Map.of[String, Object](
           "group.id",
-          s"pcl-${settings.sourceId}",
+          settings.consumerGroup,
           "auto.offset.reset",
           "earliest",
           "enable.auto.commit",
@@ -137,9 +137,15 @@ object CdcStreamingPipeline {
           .withMaxNumRecords(settings.maxRecords)
           .withMaxReadTime(org.joda.time.Duration.standardSeconds(60))
       else kafkaRead
+    // The speed layer runs unbounded on Flink and owns its offsets: KafkaIO commits the
+    // checkpointed positions to the speed consumer group after the Iceberg append. The batch
+    // layer keeps offsets uncommitted here and lets Dagster commit them after the canonical merge.
+    val positionedRead =
+      if (settings.commitOffsets) limitedRead.commitOffsetsInFinalize() else limitedRead
+
     // Keep Kafka metadata: it becomes the raw reference (topic:partition:offset), which is the
     // only stable pointer back to the original record when replaying or investigating a row.
-    val messages = pipeline.apply("Read Debezium topic", limitedRead)
+    val messages = pipeline.apply("Read Debezium topic", positionedRead)
 
     val routed: PCollectionTuple = messages.apply(
       "Normalize and validate Debezium envelopes",
@@ -150,7 +156,7 @@ object CdcStreamingPipeline {
 
     val landingWriter = IcebergIO
       .writeRows(catalog)
-      .to(TableIdentifier.of("raw", "order_cdc_events_landing"))
+      .to(tableIdentifier(settings.targetTable))
     val deadLetterWriter = IcebergIO
       .writeRows(catalog)
       .to(TableIdentifier.of("ops", "cdc_dead_letter"))
@@ -170,13 +176,21 @@ object CdcStreamingPipeline {
     routed
       .get(RawTag)
       .setRowSchema(RawSchema)
-      .apply("Append deliveries to landing", configuredLandingWriter)
+      .apply(s"Append ${settings.pipelineLayer} deliveries", configuredLandingWriter)
     routed
       .get(DeadLetterTag)
       .setRowSchema(DeadLetterSchema)
       .apply("Append rejected envelopes", configuredDeadLetterWriter)
 
     pipeline
+  }
+
+  /** Split `namespace.table` into the identifier Iceberg expects. The settings validate that at
+    * least one dot exists, so the index is always positive here.
+    */
+  private def tableIdentifier(qualified: String): TableIdentifier = {
+    val lastDot = qualified.lastIndexOf('.')
+    TableIdentifier.of(qualified.substring(0, lastDot), qualified.substring(lastDot + 1))
   }
 
   private def icebergCatalog(settings: PclSettings): IcebergCatalogConfig = {
