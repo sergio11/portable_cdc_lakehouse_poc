@@ -1,10 +1,36 @@
+<div align="center">
+
 # 🧊 Portable CDC Lakehouse 🚀
+
+[![Java 21](https://img.shields.io/badge/Java-21-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://adoptium.net/)
+[![Apache Beam 2.76](https://img.shields.io/badge/Apache_Beam-2.76-F0772B?style=for-the-badge&logo=apachebeam&logoColor=white)](https://beam.apache.org/)
+[![Apache Spark 3.5](https://img.shields.io/badge/Apache_Spark-3.5-E25A1C?style=for-the-badge&logo=apachespark&logoColor=white)](https://spark.apache.org/)
+[![Apache Flink 2.2](https://img.shields.io/badge/Apache_Flink-2.2-000000?style=for-the-badge&logo=apacheflink&logoColor=white)](https://flink.apache.org/)
+[![Apache Iceberg 1.11](https://img.shields.io/badge/Apache_Iceberg-1.11-4B32C3?style=for-the-badge&logo=apacheiceberg&logoColor=white)](https://iceberg.apache.org/)
+[![Apache Polaris 1.8](https://img.shields.io/badge/Apache_Polaris-1.8-FF6B00?style=for-the-badge)](https://polaris.apache.org/)
+[![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![Debezium 3.2](https://img.shields.io/badge/Debezium-3.2-FF6B00?style=for-the-badge&logo=debezium&logoColor=white)](https://debezium.io/)
+[![Apache Kafka 3.9](https://img.shields.io/badge/Apache_Kafka-3.9-231F2D?style=for-the-badge&logo=apachekafka&logoColor=white)](https://kafka.apache.org/)
+[![MinIO](https://img.shields.io/badge/MinIO-RELEASE.2025-10-15-5B5F97?style=for-the-badge&logo=minio&logoColor=white)](https://min.io/)
+[![Trino 476](https://img.shields.io/badge/Trino-476-0B7487?style=for-the-badge&logo=trino&logoColor=white)](https://trino.io/)
+[![Dagster 1.13](https://img.shields.io/badge/Dagster-1.13-FF6B00?style=for-the-badge&logo=dagster&logoColor=white)](https://dagster.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](#-license)
 
 ### Open-source data engineering experiment with Apache Beam, Apache Spark, Flink and Iceberg
 
 Portable CDC Lakehouse is a local Proof of Concept (POC) for capturing database changes with a **lambda architecture**: a continuous speed layer, an authoritative batch layer, and a serving layer that merges both.
 
 It uses PostgreSQL, Debezium, Kafka, Scala on the Beam Java SDK, Apache Spark, Apache Flink, Apache Iceberg, Apache Polaris, MinIO, Trino, and Dagster. The same Beam graph runs as a bounded batch read on DirectRunner or FlinkRunner and as an unbounded speed job on Flink. The speed layer owns its consumer group and checkpoints, the batch layer owns canonical history, and Trino queries a serving view that merges both by source position.
+
+> **In one paragraph:** A local POC that captures PostgreSQL CDC events via Debezium into Kafka, processes them with the same Apache Beam graph both as a continuous speed layer (Flink) and a bounded batch layer (DirectRunner/FlinkRunner), lands canonical history in Apache Iceberg on MinIO through Apache Polaris, and serves a unified current-state view through Trino — all orchestrated by Dagster and operated with Podman, Compose, and Rake.
+
+---
+
+[📋 Disclaimer](#-disclaimer) · [🎯 Project goal](#-project-goal) · [⚖️ Why this architecture](#-why-this-architecture) · [✨ Key highlights](#-key-highlights) · [🏗️ Architecture](#-architecture) · [🗂️ Data model and semantics](#-data-model-and-semantics) · [📸 Results](#-results) · [📜 License](#-license)
+
+</div>
+
+---
 
 ## ⚠️ Disclaimer
 
@@ -337,7 +363,7 @@ The same job also runs continuously on Flink, where it accumulates checkpoints:
 
 ![Beam job running on the Flink dashboard](docs/screenshots/03-flink-job-running.png)
 
-85 checkpoints completed and written to the external directory, so a restart resumes from durable state:
+117 checkpoints completed and written to the external directory, so a restart resumes from durable state:
 
 ![Flink checkpoint history](docs/screenshots/04-flink-checkpoints.png)
 
@@ -647,4 +673,30 @@ This is a **proof of concept**, not a production-ready platform. Restart/recover
 
 ## 📜 License
 
-See [LICENSE](LICENSE).
+This is a Proof of Concept. Not intended for production use.
+
+This project is licensed under the MIT License, an open-source software license that allows developers to freely use, copy, modify, and distribute the software. This includes use in both personal and commercial projects. The only requirement is that the original copyright notice and this permission notice be included in all copies or substantial portions of the Software.
+
+```
+MIT License
+
+Copyright (c) 2026 Sergio Sanchez
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
