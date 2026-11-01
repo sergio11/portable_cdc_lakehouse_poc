@@ -75,97 +75,148 @@ The trade-off is explicit: two processing paths, two consumer groups, a transien
 
 ## 🏗️ Architecture
 
-This is a **lambda architecture** with three independent layers:
-
-- **Speed layer**: a continuous Beam-on-Flink job reads Kafka with its own consumer group, normalizes CDC, and appends to `speed.order_cdc_events`. It owns its offsets through Flink checkpoints. It is disposable: losing it costs freshness, never history.
-- **Batch layer**: Dagster triggers a bounded Beam read with a different consumer group, merges the landing buffer into canonical `raw` by `event_id`, and materializes `silver.orders_current` from the full history. This layer is authoritative.
-- **Serving layer**: `serving.orders_current` is an Iceberg view that merges batch and speed by source position at query time. Trino reads it and owns its definition (the only write Trino performs). A speed row overrides batch only when its LSN is newer.
+This is a **lambda architecture**: one CDC stream feeds two processors that never depend on each other, and a serving layer decides at query time which version of each row is current. The rule that makes the design work is simple: **only the batch layer writes canonical history**. The speed layer appends a disposable buffer, the batch layer builds the canonical truth from the source stream, and the serving layer merges both without copying either.
 
 ```mermaid
 flowchart TD
     PG[(PostgreSQL<br/>orders + WAL)] -->|logical decoding| DBZ[Debezium<br/>Kafka Connect]
     DBZ -->|CDC envelopes| K[(Kafka<br/>pcl.public.orders)]
 
-    K -->|continuous, group pcl-speed-*| SPEED[Beam on Flink<br/>speed layer]
-    K -->|bounded, group pcl-batch-*| BATCH[Beam batch<br/>Direct or Flink]
+    subgraph SPEED["Speed layer — continuous, disposable"]
+        SF[Beam on Flink<br/>group pcl-speed-*]
+        ST[(speed.order_cdc_events<br/>append-only)]
+        SF -->|append accepted| ST
+    end
 
-    SPEED -->|append| SPEEDT[(Iceberg speed<br/>order_cdc_events)]
-    BATCH -->|append| LANDING[(Iceberg raw<br/>landing)]
-    BATCH -.->|invalid envelopes| DLQ[(ops<br/>cdc_dead_letter)]
+    subgraph BATCH["Batch layer — every 5 minutes, authoritative"]
+        BB[Beam bounded read<br/>group pcl-batch-*]
+        LAND[(raw.order_cdc_events_landing<br/>transient)]
+        SPK[Spark]
+        RAW[(raw.order_cdc_events<br/>one row per event_id)]
+        SILVER[(silver.orders_current<br/>one row per order)]
+        BB -->|append deliveries| LAND
+        LAND -->|MERGE by event_id| SPK
+        SPK --> RAW
+        SPK --> SILVER
+    end
 
-    LANDING -->|idempotent MERGE by event_id| SPARK[Spark batch]
-    SPARK --> RAW[(raw canonical<br/>order_cdc_events)]
-    SPARK --> SILVER[(silver batch view<br/>orders_current)]
-    SPARK --> STATE[(ops<br/>materialization_state)]
+    subgraph SERVING["Serving layer — query time"]
+        VIEW[serving.orders_current<br/>Iceberg view]
+        TRINO[Trino<br/>SQL endpoint]
+        PROV[Trino pcl-provisioner<br/>view owner]
+        VIEW -->|read| TRINO
+        PROV -.->|CREATE OR REPLACE VIEW| VIEW
+    end
 
-    RAW -->|release canonical events| COMPACT[Spark compaction]
-    COMPACT -->|delete| SPEEDT
-
-    RAW --> VIEW[serving.orders_current<br/>batch + speed merge]
+    K --> SF
+    K --> BB
+    RAW -.->|delete canonical event_ids| ST
     SILVER --> VIEW
-    SPEEDT --> VIEW
-    TRINO[Trino<br/>SQL serving] -->|defines the view| VIEW
-    VIEW --> TRINO
+    ST --> VIEW
 
-    DAG[Dagster<br/>every 5 minutes] -.->|lag, offsets, MERGE| BATCH
-    DAG -.-> SPARK
-    DAG -.-> COMPACT
-    DAG -.->|creates when missing| TRINO
+    DLQ[(ops.cdc_dead_letter)]
+    SF -.->|invalid envelopes| DLQ
+    BB -.->|invalid envelopes| DLQ
+
+    DAG[Dagster<br/>batch scheduler] -.->|lag, offsets, MERGE| BB
+    DAG -.-> SPK
+    DAG -.->|provision when missing| PROV
 ```
 
-Polaris serves the Iceberg catalog and MinIO stores the data files. The speed and batch readers use **different consumer groups**, so they never steal partitions from each other. Batch is the source of truth; the speed table is a real-time buffer that is compacted away once canonical `raw` holds the same `event_id`. Trino is the serving engine and the view owner: Iceberg stores one SQL dialect per view and Trino rejects Spark's, so the view definition is written by Trino's `pcl-provisioner` identity while every table write stays in Spark. Replay writes `silver.orders_current_replay_ID`, an isolated table that the diagram omits for clarity.
+Polaris serves the Iceberg catalog and MinIO stores the data files, so every engine resolves the same tables. The diagram omits replay for clarity: `lakehouse:replay` rebuilds an isolated `silver.orders_current_replay_<id>` table from `raw` and never touches the canonical path.
 
-### 🔄 Runtime flow
+**Vocabulary.** Five terms are used throughout the README:
 
-The two layers run on independent clocks. That is the point of lambda: a slow or failed batch run never stops the real-time path, and a speed-layer restart never changes canonical history.
+| Term | Meaning |
+|---|---|
+| **Event** | One logical row change, identified by `event_id`. |
+| **Delivery** | One Kafka record that carries an event. At-least-once transport means the same event can arrive more than once. |
+| **Canonical** | The single row in `raw.order_cdc_events` for an `event_id`. Both layers derive the same id for the same change. |
+| **Source position** | `(lsn, tx_id, seq_no)`. LSN alone is not a total order: a transaction can change several rows, and snapshot rows can share a position. |
+| **Watermark** | The newest arrival time already folded into `silver.orders_current`. |
 
-**Speed loop (continuous, seconds):**
+### 🧱 The three layers
 
-1. `pipeline-speed` reads Kafka with `pcl-speed-<source>` and `auto.offset.reset=earliest`.
-2. Beam normalizes each Debezium envelope, ignores Kafka tombstones, and appends accepted events to `speed.order_cdc_events`. Invalid envelopes go to `ops.cdc_dead_letter`.
-3. Flink checkpoints every 10 seconds with RocksDB and externalized checkpoints. KafkaIO commits the checkpointed positions to the speed consumer group, so a restart resumes from durable state instead of re-reading the topic.
-4. The speed job never writes `raw`, `silver` or the batch offsets. It can be stopped, restarted or truncated without touching the authoritative history.
+| Layer | Reads | Writes | Owns | If it stops |
+|---|---|---|---|---|
+| **Speed** | Kafka, group `pcl-speed-<source>` | `speed.order_cdc_events` (append), dead letters | Flink checkpoints and the speed group offsets | Serving loses freshness; history is untouched. |
+| **Batch** | Kafka, group `pcl-batch-<source>` | landing, `raw`, `silver`, speed compaction, replay tables | Canonical history, the materialization watermark, the batch group offsets | Serving keeps the last batch plus whatever speed still holds. |
+| **Serving** | `silver` + `speed` through an Iceberg view | The view definition, through Trino | The merge rule itself | Queries fail; no stored data changes. |
 
-**Batch loop (every five minutes, authoritative):**
+Both processors run the **same Beam graph**. Layer, consumer group, target table and offset policy are configuration (`PclSettings`), not separate code: batch writes `raw.order_cdc_events_landing` and leaves offsets to Dagster; speed writes `speed.order_cdc_events` and commits offsets through Flink checkpoints.
 
-1. Dagster measures lag on `pcl-batch-<source>`: `end offset - committed offset`. The batch and speed groups are separate, so the speed job does not advance the batch position.
-2. Beam performs a bounded read of exactly that lag, normalizes, and appends to `raw.order_cdc_events_landing`.
-3. Spark merges landing into canonical `raw`: newest delivery per `event_id`, insert-only `MERGE`, metrics, and release of the deliveries `raw` already holds. Cleanup is keyed on `event_id`, not on a timestamp or batch.
-4. Dagster commits the batch offsets **after** the merge. A crash before this point re-reads the same records; the merge absorbs them.
-5. Spark materializes `silver.orders_current` from canonical `raw`: it reads the watermark, selects keys with arrivals since the last run, re-ranks their full history, applies the idempotent `MERGE`, and advances the watermark. Deletes become versioned tombstones.
-6. Spark compacts the speed table: every speed delivery whose `event_id` is already canonical is deleted. The speed job may keep writing during compaction; a new event is never removed.
-7. Trino owns `serving.orders_current`: it creates the view when it is missing, and `rake lakehouse:serve` refreshes the definition after a change. That view definition is the only write Trino performs; every table write stays in Spark. Trino answers queries from the merged view.
+### 🔁 What happens to one event
 
-**Serving rule:** for each `order_id`, the row with the highest `(lsn, tx_id, seq_no, event_id)` wins across batch and speed. Batch wins ties. A speed event only appears when it is genuinely newer than the batch view, so batch remains authoritative up to its watermark and speed covers the gap after it.
+1. **Capture.** Debezium reads the PostgreSQL WAL and publishes one Kafka envelope per change to `pcl.public.orders`, with `lsn`, `txId`, `sequence`, and before/after images. Debezium also emits a key-only tombstone after a delete; it carries no payload, so Beam counts it without processing it.
+2. **Normalize.** Beam validates the envelope and derives `event_id` deterministically from source, schema, table, LSN, transaction, sequence and primary key. It also keeps `raw_reference = topic:partition:offset`. An invalid envelope is written to `ops.cdc_dead_letter` with a stable reason code instead of being dropped.
+3. **Fan out.** The speed job appends every accepted event to `speed.order_cdc_events`, duplicates included, and checkpoints every 10 seconds. The batch job reads exactly the lag Dagster measured and appends those deliveries to the landing buffer.
+4. **Deduplicate at ingest.** Spark merges landing into `raw` by `event_id`: it keeps the newest delivery per event, inserts only events it has not seen, and then deletes from landing only the deliveries `raw` already holds. A repeated delivery is absorbed; a new event waits for the next run.
+5. **Commit offsets.** Dagster commits the batch group offsets **after** the merge succeeds. A crash before that point re-reads the same records, and the `event_id` merge makes the re-read harmless.
+6. **Project.** Spark materializes `silver.orders_current` incrementally. It reads the watermark, selects the keys that arrived since it, re-ranks their full history by source position, applies an idempotent `MERGE`, and advances the watermark. A delete becomes a versioned tombstone (`is_deleted = true`) instead of removing the row.
+7. **Compact.** Spark deletes from `speed` every row whose `event_id` is already canonical in `raw`. Because the key is identity and not time, an event the speed job writes during compaction is never removed.
+8. **Serve.** Trino evaluates `serving.orders_current` over `silver` and `speed` at query time. Nothing is copied or synchronized.
 
-`lakehouse:replay` and `dagster:replay` rebuild an isolated table from canonical `raw`; they never touch the serving view or the batch watermark.
+### ⚖️ How the serving view resolves an order
 
-The two loops, side by side:
+The view applies four steps, in this order:
+
+1. **Normalize speed rows.** Extract `order_id` from the canonical `primary_key`, and build the same columns the batch view exposes.
+2. **Union both layers.** Batch rows carry `layer_rank = 0`; speed rows carry `layer_rank = 1`.
+3. **Collapse duplicate events.** Keep one row per `last_event_id`, preferring rank 0. If batch already holds an event, its copy replaces the speed copy.
+4. **Pick one row per order.** Order by `last_lsn DESC`, then `last_tx_id` numerically, then `last_seq_no`, then `last_event_id`, all descending, and keep the first.
+
+The consequence is the rule the whole design depends on: **for an order present in both layers, a speed row can only win with a strictly newer source position, and batch wins every exact-event tie.** A delayed batch run therefore cannot regress a key the speed layer already advanced, and a duplicated speed delivery cannot shadow a newer batch row.
+
+Concretely: if `silver` holds order 1003 at LSN 49,882,848 (`SHIPPED`) and `speed` holds the same order at LSN 56,098,232 (`CANCELLED`), the view returns `CANCELLED`. When batch ingests that event, its copy wins the `event_id` collapse and Spark removes the speed row; the query answer does not change.
+
+### ✍️ Who writes what
+
+| Writer | Writes | Never writes |
+|---|---|---|
+| Beam, batch mode | `raw.order_cdc_events_landing`, `ops.cdc_dead_letter` | `raw`, `silver`, `speed` |
+| Beam, speed mode | `speed.order_cdc_events`, `ops.cdc_dead_letter` | `raw`, `silver`, landing |
+| Spark | `raw`, `silver`, speed compaction, replay tables, DDL | The serving view |
+| Trino | The `serving.orders_current` definition, through `pcl-provisioner` | Any table |
+| Dagster | Batch offsets and orchestration | Data files |
+
+The split exists because Iceberg stores a view with a single SQL dialect, and Trino rejects a view written in Spark's dialect. Trino therefore owns the view definition while Spark remains the only writer of tables.
+
+### 🛡️ Why the layers are independent
+
+- **Separate consumer groups.** `pcl-speed-<source>` and `pcl-batch-<source>` advance independently. The speed job never moves the batch position, and a batch run never steals a partition from the speed job.
+- **At-least-once with idempotent effects.** Both reads are at-least-once. In speed, a restart can re-append duplicates, which the view deduplicates and compaction removes. In batch, offsets are committed only after the canonical merge, and the merge is keyed on `event_id`, so a retry converges on the same `raw`.
+- **Disposable speed, authoritative batch.** Losing `speed.order_cdc_events` costs freshness, never history: `raw` and `silver` are built from the Kafka stream and can be rebuilt. Losing a batch run costs time: the next run re-reads from the last committed offset.
+- **No synchronization in serving.** The view reads the latest committed Iceberg snapshots of both tables. There is no third copy to keep consistent, and batch remains authoritative up to its watermark while speed covers the gap after it.
+- **Replay is isolated.** `lakehouse:replay` rebuilds a separate table from `raw`; it never touches `silver`, the watermark, or the view.
+
+### ⏱️ Two clocks
+
+The layers run on different triggers, and that is the point: a slow or failed batch run never stops the real-time path, and a speed restart never changes canonical history.
 
 ```mermaid
 sequenceDiagram
     participant K as Kafka
-    participant S as Speed Flink
+    participant S as Speed (Flink)
     participant G as Dagster
-    participant B as Batch Beam
+    participant B as Batch (Beam)
     participant X as Spark
     participant V as Serving view
 
     loop continuous
-        K->>S: CDC envelopes (pcl-speed-*)
+        K->>S: deliveries (pcl-speed-*)
         S->>S: append to speed.order_cdc_events
         S->>K: commit checkpointed offsets
     end
 
     loop every 5 minutes
-        G->>K: lag on pcl-batch-*
+        G->>K: measure lag on pcl-batch-*
         G->>B: bounded read of that lag
-        K->>B: CDC envelopes
-        B->>X: append to raw.landing
-        X->>X: MERGE landing into canonical raw
+        K->>B: deliveries
+        B->>X: append to raw landing
+        X->>X: merge into raw, materialize silver
         G->>K: commit batch offsets after the merge
-        X->>X: materialize silver, compact speed
-        G->>V: create serving.orders_current via Trino when missing
+        X->>X: compact speed against raw
+        G->>V: provision the view when missing
     end
 ```
 
@@ -294,7 +345,7 @@ SELECT * FROM serving.orders_current WHERE NOT is_deleted ORDER BY order_id;
 
 ## 📸 Results
 
-The stack runs end to end: PostgreSQL changes reach Kafka, the batch Beam job lands them in Iceberg, Spark merges one row per event and maintains the batch view, and Trino reads the serving view. The captures below prove the **batch layer** and its invariants; the **speed layer** is exercised with `bundle exec rake pipeline:speed:up` and is visible through `serving.orders_current` while it runs. Each subsection shows one capability with the output that proves it.
+The stack runs end to end: PostgreSQL changes reach Kafka, the continuous Flink job serves them within seconds, the batch Beam job lands them in Iceberg, Spark merges one row per event and maintains the batch view, and Trino reads the serving view. The captures below show both layers and the invariants that connect them. Each subsection presents one capability with the output that proves it.
 
 ### 1. Apache Polaris owns the catalog
 
@@ -363,7 +414,7 @@ The same job also runs continuously on Flink, where it accumulates checkpoints:
 
 ![Beam job running on the Flink dashboard](docs/screenshots/03-flink-job-running.png)
 
-117 checkpoints completed and written to the external directory, so a restart resumes from durable state:
+The checkpoint history shows the externalized checkpoints Flink writes, so a restart resumes from durable state:
 
 ![Flink checkpoint history](docs/screenshots/04-flink-checkpoints.png)
 
