@@ -4,7 +4,6 @@
 dagster==1.13.27
 dagster-webserver==1.13.27
 dagster-postgres==0.29.27
-confluent-kafka==2.16.0
 requests==2.32.5
 # SQLAlchemy 2.1 resolves bare postgresql:// URLs to the psycopg 3 driver, which
 # dagster-postgres does not install. Stay on the 2.0 line so the declared

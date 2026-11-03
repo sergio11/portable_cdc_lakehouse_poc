@@ -1,32 +1,25 @@
 # frozen_string_literal: true
 
 namespace :pipeline do
-  # `layer` decides the consumer group and the Iceberg target. Batch runs are
-  # bounded and leave offsets to Dagster; the speed layer is unbounded, owns its
-  # offsets through Flink checkpoints, and writes to its own table.
-  def run_pipeline(runner_args, flink_cluster: false, layer: "batch")
+  # Bounded DirectRunner portability check; it appends and leaves offsets alone.
+  def run_bounded(runner_args)
     env = Config.load_env!
-    Build.container_sbt("assembly")
 
-    if flink_cluster
-      Infra.compose(
-        "--profile", "flink", "up", "-d", "--no-deps", "flink-jobmanager", "flink-taskmanager"
-      )
-      web_port = env.fetch("PCL_FLINK_WEB_PORT", "8081")
-      Infra.wait_until!("Flink JobManager REST API at localhost:#{web_port}") do
-        Infra.http_ok?("http://localhost:#{web_port}/overview")
-      end
-      puts "Flink cluster ready: http://localhost:#{web_port}"
+    # Must terminate, unlike the unbounded speed job.
+    max_records = ENV.fetch("PCL_MAX_RECORDS", "")
+    unless max_records.match?(/\A\d+\z/) && max_records.to_i.positive?
+      abort("Set PCL_MAX_RECORDS to a positive record count for the bounded DirectRunner run.")
     end
 
+    Build.container_sbt("assembly")
+
     source_id = env.fetch("PCL_SOURCE_ID")
-    speed = layer == "speed"
     runtime_env = env.merge(
-      "PCL_PIPELINE_LAYER" => layer,
-      "PCL_CONSUMER_GROUP" => speed ? "pcl-speed-#{source_id}" : "pcl-batch-#{source_id}",
-      "PCL_TARGET_TABLE" => speed ? "speed.order_cdc_events" : "raw.order_cdc_events_landing",
-      "PCL_COMMIT_OFFSETS" => speed ? "true" : "false",
-      "PCL_MAX_RECORDS" => speed ? "0" : ENV.fetch("PCL_MAX_RECORDS", env.fetch("PCL_MAX_RECORDS", "0"))
+      "PCL_PIPELINE_LAYER" => "batch",
+      "PCL_CONSUMER_GROUP" => "pcl-batch-#{source_id}",
+      "PCL_TARGET_TABLE" => "raw.order_cdc_events",
+      "PCL_COMMIT_OFFSETS" => "false",
+      "PCL_MAX_RECORDS" => max_records
     )
     env_file = Config.render_pipeline_env!(runtime_env)
     run!(
@@ -42,64 +35,72 @@ namespace :pipeline do
     )
   end
 
-  desc "Build and run the bounded batch graph with DirectRunner on pcl_default"
+  desc "Build and run the bounded graph with DirectRunner (manual portability check)"
   task :direct do
-    run_pipeline([], layer: "batch")
+    run_bounded([])
   end
 
-  desc "Run the continuous speed layer on Flink in the foreground (own group, own table)"
-  task :flink do
-    run_pipeline(
-      [
-        "--runner=org.apache.beam.runners.flink.FlinkRunner",
-        "--flinkMaster=flink-jobmanager:8081",
-        # Checkpointing is what makes the streaming job restartable. KafkaIO
-        # commits the checkpointed positions to the speed consumer group.
-        "--checkpointingInterval=10000",
-        "--checkpointingMode=EXACTLY_ONCE",
-        "--externalizedCheckpointsEnabled=true",
-        "--retainExternalizedCheckpointsOnCancellation=true"
-      ],
-      flink_cluster: true,
-      layer: "speed"
-    )
-  end
-
-  desc "Start the speed layer as a restartable Compose service (Flink + pipeline-speed)"
+  desc "Start the speed writers as Compose services (Flink + Beam speed + SQL serving)"
   task "speed:up" do
     env = Config.load_env!
     Build.container_sbt("assembly")
+    Config.render_flink_serving!(env)
+
+    # Bring the cluster up before any submitter: the SQL client fails fast.
     Infra.compose(
       "--profile", "flink", "--profile", "speed",
-      # `--no-deps` is deliberate: `infra:up` already owns the shared stack, and
-      # letting Compose walk `depends_on` here makes podman-compose try to
-      # recreate Kafka (and fail on the existing container name).
-      "up", "-d", "--no-deps", "flink-jobmanager", "flink-taskmanager", "pipeline-speed"
+      "build", "flink-jobmanager"
+    )
+    Infra.compose(
+      "--profile", "flink", "--profile", "speed",
+      # `--no-deps`: infra:up already owns the shared stack.
+      "up", "-d", "--no-deps", "flink-jobmanager", "flink-taskmanager"
     )
     web_port = env.fetch("PCL_FLINK_WEB_PORT", "8081")
     Infra.wait_until!("Flink JobManager REST API at localhost:#{web_port}") do
       Infra.http_ok?("http://localhost:#{web_port}/overview")
     end
-    puts "Speed layer running: pcl-speed-#{env.fetch('PCL_SOURCE_ID')} -> speed.order_cdc_events"
+
+    Infra.compose(
+      "--profile", "flink", "--profile", "speed",
+      "up", "-d", "--no-deps", "pipeline-speed"
+    )
+
+    # The SQL submitter exits after handing the job to the session cluster, so
+    # only start it when the job is not already running. Without this guard a
+    # second `speed:up` would submit a duplicate writer.
+    if Flink.running?("pcl-serving", env)
+      puts "Flink SQL serving job is already running; not resubmitting."
+    else
+      Infra.compose(
+        "--profile", "flink", "--profile", "speed",
+        "up", "-d", "--no-deps", "pipeline-serving"
+      )
+    end
+
+    puts "Speed layer running: pcl-speed-#{env.fetch('PCL_SOURCE_ID')} -> raw.order_cdc_events"
+    puts "Serving writer running: raw.order_cdc_events -> serving.orders_current"
     puts "Flink dashboard: http://localhost:#{web_port}"
   end
 
-  desc "Stop the speed layer and its Flink cluster (checkpoints are kept)"
+  desc "Stop the speed writers and their Flink cluster (checkpoints are kept)"
   task "speed:down" do
     Config.load_env!
     Infra.compose(
       "--profile", "flink", "--profile", "speed",
-      "stop", "pipeline-speed", "flink-taskmanager", "flink-jobmanager"
+      "stop", "pipeline-serving", "pipeline-speed", "flink-taskmanager", "flink-jobmanager"
     )
   end
 
-  desc "Show the speed layer and Flink cluster status"
+  desc "Show the speed writers and Flink cluster status"
   task "speed:status" do
-    Config.load_env!
+    env = Config.load_env!
     Infra.compose(
       "--profile", "flink", "--profile", "speed",
-      "ps", "pipeline-speed", "flink-jobmanager", "flink-taskmanager"
+      "ps", "pipeline-serving", "pipeline-speed", "flink-jobmanager", "flink-taskmanager"
     )
+    jobs = Flink.jobs(env)
+    jobs.each { |job| puts format("  %-10s %s", job["state"], job["name"]) }
   end
 
   desc "Stop the local Flink JobManager and TaskManager"

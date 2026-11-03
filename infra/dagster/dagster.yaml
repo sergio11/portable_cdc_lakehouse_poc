@@ -15,9 +15,9 @@ storage:
 telemetry:
   enabled: false
 
-# Serialize runs: the merge writes the landing table and canonical raw, and two
-# overlapping merges make Iceberg abort one of them with a conflicting-files
-# validation error. A tick that fires while a run is active waits in the queue.
+# Serialize runs: two overlapping projections would both rewrite the same
+# Iceberg files and make one abort with a conflicting-files validation error. A
+# tick that fires while a run is active waits in the queue.
 run_coordinator:
   module: dagster._core.run_coordinator
   class: QueuedRunCoordinator

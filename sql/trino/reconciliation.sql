@@ -1,69 +1,31 @@
--- ---------------------------------------------------------------------------
--- Reconciliation queries.
+-- Reconciliation queries. Run: rake query:file[sql/trino/reconciliation.sql]
 --
--- Run with:  rake query:file[sql/trino/reconciliation.sql]
---
--- raw.order_cdc_events is canonical: Spark merges the landing deliveries into
--- it with one row per event_id, so the history is the audit trail and the
--- projection is the thing under test. A duplicate in raw is a failed ingest,
--- not an expected condition; section 2 asserts that invariant.
---
--- In the lambda layout, speed.order_cdc_events is a real-time buffer that may
--- contain duplicates, and serving.orders_current is the merged view. Sections
--- 9 and 10 assert the speed layer is compacted and the serving view is never
--- older than the batch view.
--- ---------------------------------------------------------------------------
+-- raw is at-least-once, so duplicate event_id deliveries are expected (section 2).
+-- silver is authoritative; serving may be ahead but must never be behind (8, 9).
 
--- ---------------------------------------------------------------------------
--- 1. Live vs deleted split of the projection. Business queries always filter
---    is_deleted = false; this makes an accidental filter regression visible.
--- ---------------------------------------------------------------------------
+-- 1. Live vs deleted split of the projection.
 SELECT is_deleted, count(*) AS rows_in_projection
   FROM silver.orders_current
  GROUP BY is_deleted
  ORDER BY is_deleted;
 
--- ---------------------------------------------------------------------------
--- 2. Raw uniqueness invariant. Spark merges landing deliveries by event_id, so
---    this must always return 0. A non-zero result means the merge did not run
---    or failed, and materialization would rank duplicated history.
--- ---------------------------------------------------------------------------
-SELECT count(*) AS duplicated_event_ids,
-       coalesce(sum(copies - 1), 0) AS extra_copies
-  FROM (
-    SELECT event_id, count(*) AS copies
-      FROM raw.order_cdc_events
-     WHERE table_name = 'orders'
-     GROUP BY event_id
-    HAVING count(*) > 1
-  ) duplicates;
+-- 2. Event log shape: distinct event_id is what silver projects.
+SELECT count(*)                            AS raw_deliveries,
+       count(DISTINCT event_id)             AS raw_events,
+       count(*) - count(DISTINCT event_id)  AS duplicate_deliveries
+  FROM raw.order_cdc_events
+ WHERE table_name = 'orders';
 
--- ---------------------------------------------------------------------------
--- 3. Landing backlog. Rows wait here only between the Beam append and the
---    Spark merge; a growing backlog means the merge is not keeping up.
--- ---------------------------------------------------------------------------
-SELECT count(*)                 AS landing_rows,
-       count(DISTINCT batch_id) AS landing_batches
-  FROM raw.order_cdc_events_landing;
-
--- ---------------------------------------------------------------------------
--- 4. Expected key set, derived by replaying the history: the set of keys ever
---    observed. Any key present in the projection but absent here would be a
---    phantom row; any key here but absent from the projection a lost row.
--- ---------------------------------------------------------------------------
+-- 3. Key set ever observed in the history.
 SELECT DISTINCT primary_key AS order_key
   FROM raw.order_cdc_events
  WHERE table_name = 'orders'
  ORDER BY 1;
 
--- ---------------------------------------------------------------------------
--- 5. Last event per key by source position, which is what the projection is
---    expected to reflect. source_timestamp is deliberately NOT used for
---    ordering: arrival or wall-clock order is not a valid precedence.
--- ---------------------------------------------------------------------------
+-- 4. Last event per key by source position (never by wall-clock time).
 SELECT primary_key,
-       max(lsn)            AS last_lsn,
-       count(*)            AS events_seen,
+       max(lsn)                 AS last_lsn,
+       count(*)                 AS deliveries,
        count(DISTINCT event_id) AS distinct_events,
        bool_or(operation = 'DELETE') AS saw_delete
   FROM raw.order_cdc_events
@@ -71,20 +33,21 @@ SELECT primary_key,
  GROUP BY primary_key
  ORDER BY primary_key;
 
--- ---------------------------------------------------------------------------
--- 6. Discrepancy report. This compares the projection against the latest
---    business image in the history, not just the source position. A row here
---    is a failed reconciliation, not an informational record.
---
---    Checks:
---      projection_missing  - the history knows a key the projection does not
---      position_behind     - the projection applied an older source position
---      position_ahead      - the projection is newer than the history
---      tombstone_mismatch  - is_deleted disagrees with the last operation
---      operation_mismatch  - last_operation disagrees with the history
---      *_mismatch          - a business column differs from the latest image
--- ---------------------------------------------------------------------------
-WITH ranked AS (
+-- 5. Discrepancy report: projection vs the latest business image in the history.
+WITH deduped AS (
+    SELECT *
+      FROM (
+        SELECT e.*,
+               row_number() OVER (
+                 PARTITION BY event_id
+                 ORDER BY ingested_at DESC
+               ) AS delivery_rank
+          FROM raw.order_cdc_events e
+         WHERE table_name = 'orders'
+      ) copies
+     WHERE delivery_rank = 1
+),
+ranked AS (
     SELECT primary_key,
            operation,
            lsn,
@@ -99,8 +62,7 @@ WITH ranked AS (
                       seq_no DESC NULLS LAST,
                       event_id DESC
            ) AS event_rank
-      FROM raw.order_cdc_events
-     WHERE table_name = 'orders'
+      FROM deduped
 ),
 expected AS (
     SELECT try_cast(regexp_extract(primary_key, 'order_id=([^#]+)', 1) AS BIGINT) AS order_id,
@@ -136,17 +98,17 @@ SELECT expected.order_id,
          WHEN projection.last_lsn < expected.last_lsn  THEN 'position_behind'
          WHEN projection.last_lsn > expected.last_lsn  THEN 'position_ahead'
          WHEN projection.is_deleted IS DISTINCT FROM expected.is_deleted
-                                                       THEN 'tombstone_mismatch'
+                                                        THEN 'tombstone_mismatch'
          WHEN projection.last_operation IS DISTINCT FROM expected.last_operation
-                                                       THEN 'operation_mismatch'
+                                                        THEN 'operation_mismatch'
          WHEN projection.customer_id IS DISTINCT FROM try_cast(expected.image['customer_id'] AS BIGINT)
-                                                       THEN 'customer_id_mismatch'
+                                                        THEN 'customer_id_mismatch'
          WHEN projection.status IS DISTINCT FROM expected.image['status']
-                                                       THEN 'status_mismatch'
+                                                        THEN 'status_mismatch'
          WHEN projection.total_amount IS DISTINCT FROM try_cast(expected.image['total_amount'] AS DECIMAL(12,2))
-                                                       THEN 'total_amount_mismatch'
+                                                        THEN 'total_amount_mismatch'
          WHEN projection.currency IS DISTINCT FROM expected.image['currency']
-                                                       THEN 'currency_mismatch'
+                                                        THEN 'currency_mismatch'
          ELSE 'ok'
        END                            AS discrepancy
   FROM expected
@@ -154,43 +116,66 @@ SELECT expected.order_id,
     ON projection.order_id = expected.order_id
  ORDER BY discrepancy, expected.order_id;
 
--- ---------------------------------------------------------------------------
--- 7. Event counts per operation, the headline observability counter.
--- ---------------------------------------------------------------------------
+-- 6. Deliveries per operation.
 SELECT operation,
-       count(*)                            AS events,
-       count(DISTINCT event_id)            AS distinct_events,
-       bool_or(is_snapshot)                AS includes_snapshot
+       count(*)                 AS deliveries,
+       count(DISTINCT event_id) AS events,
+       count_if(is_snapshot)    AS snapshot_deliveries
   FROM raw.order_cdc_events
  WHERE table_name = 'orders'
  GROUP BY operation
  ORDER BY operation;
 
--- ---------------------------------------------------------------------------
--- 8. Dead letter overview, by reason code.
--- ---------------------------------------------------------------------------
+-- 7. Dead letter overview, by reason code.
 SELECT reason_code, count(*) AS rejected_events
   FROM ops.cdc_dead_letter
  GROUP BY reason_code
  ORDER BY reason_code;
 
--- ---------------------------------------------------------------------------
--- 9. Speed layer health. Duplicates are expected in this buffer; stale rows
---    (already canonical in raw) must be 0 after compaction.
--- ---------------------------------------------------------------------------
-SELECT count(*)                                  AS speed_rows,
-       count(DISTINCT event_id)                  AS speed_event_ids,
-       count(*) - count(DISTINCT event_id)       AS speed_duplicates,
-       count_if(event_id IN (SELECT event_id FROM raw.order_cdc_events)) AS speed_stale
-  FROM speed.order_cdc_events;
-
--- ---------------------------------------------------------------------------
--- 10. Serving lag. Batch is authoritative, so no key may be older in the
---     serving view than in the batch view. A speed row may legitimately be
---     newer; that is the lambda merge working.
--- ---------------------------------------------------------------------------
-SELECT count(*) AS keys_lagging_batch
+-- 8. Serving shape: it may be ahead of silver, never behind.
+SELECT count(*)                                              AS serving_rows,
+       count_if(NOT s.is_deleted)                            AS serving_live,
+       count_if(b.order_id IS NULL)                          AS serving_ahead_of_silver,
+       count_if(b.order_id IS NOT NULL AND s.last_lsn < b.last_lsn) AS serving_behind_silver
   FROM serving.orders_current s
-  JOIN silver.orders_current b
-    ON b.order_id = s.order_id
- WHERE b.last_lsn > s.last_lsn;
+  LEFT JOIN silver.orders_current b
+    ON b.order_id = s.order_id;
+
+-- 9. Serving discrepancies: every key silver knows must be present and not behind.
+SELECT b.order_id,
+       b.last_lsn            AS silver_last_lsn,
+       s.last_lsn            AS serving_last_lsn,
+       b.last_operation      AS silver_last_operation,
+       s.last_operation      AS serving_last_operation,
+       CASE
+         WHEN s.order_id IS NULL          THEN 'serving_missing'
+         WHEN s.last_lsn < b.last_lsn     THEN 'serving_behind'
+         WHEN s.customer_id IS DISTINCT FROM b.customer_id   THEN 'customer_id_mismatch'
+         WHEN s.status IS DISTINCT FROM b.status             THEN 'status_mismatch'
+         WHEN s.total_amount IS DISTINCT FROM b.total_amount THEN 'total_amount_mismatch'
+         WHEN s.currency IS DISTINCT FROM b.currency         THEN 'currency_mismatch'
+         WHEN s.is_deleted IS DISTINCT FROM b.is_deleted     THEN 'tombstone_mismatch'
+         WHEN s.last_operation IS DISTINCT FROM b.last_operation
+                                                             THEN 'operation_mismatch'
+         WHEN s.last_event_id IS DISTINCT FROM b.last_event_id
+                                                             THEN 'event_mismatch'
+         ELSE 'ok'
+       END                   AS serving_discrepancy
+  FROM silver.orders_current b
+  LEFT JOIN serving.orders_current s
+    ON s.order_id = b.order_id
+ WHERE s.order_id IS NULL
+    OR s.last_lsn < b.last_lsn
+    OR (
+      s.last_lsn = b.last_lsn
+      AND (
+        s.customer_id IS DISTINCT FROM b.customer_id
+        OR s.status IS DISTINCT FROM b.status
+        OR s.total_amount IS DISTINCT FROM b.total_amount
+        OR s.currency IS DISTINCT FROM b.currency
+        OR s.is_deleted IS DISTINCT FROM b.is_deleted
+        OR s.last_operation IS DISTINCT FROM b.last_operation
+        OR s.last_event_id IS DISTINCT FROM b.last_event_id
+      )
+    )
+ ORDER BY serving_discrepancy, b.order_id;

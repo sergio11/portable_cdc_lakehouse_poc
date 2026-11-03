@@ -1,6 +1,7 @@
 # Dagster is the scheduled entrypoint for the lakehouse. The image stays small:
-# it needs a Python runtime plus the docker CLI, because Spark and Beam run as
-# sibling containers started through the host Podman socket. No JVM here.
+# it needs a Python runtime plus the docker CLI, because Spark runs as sibling
+# containers started through the host Podman socket. No JVM here: the Flink
+# speed and serving writers run outside this graph.
 FROM docker.io/docker:27-cli AS cli
 
 FROM docker.io/library/python:3.12-slim

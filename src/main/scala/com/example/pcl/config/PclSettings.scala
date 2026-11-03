@@ -19,7 +19,7 @@ final case class PclSettings(
     primaryKeyColumns: List[String] = List("order_id"),
     pipelineLayer: String = "batch",
     consumerGroup: String = "",
-    targetTable: String = "raw.order_cdc_events_landing",
+    targetTable: String = "raw.order_cdc_events",
     commitOffsets: Boolean = false
 )
 
@@ -44,7 +44,7 @@ object PclSettings {
     for {
       runId    <- env.get("PCL_RUN_ID").toRight(MissingRunId)
       sourceId <- env.get("PCL_SOURCE_ID").toRight(MissingSourceId)
-      target <- validTargetTable(env.getOrElse("PCL_TARGET_TABLE", "raw.order_cdc_events_landing"))
+      target <- validTargetTable(env.getOrElse("PCL_TARGET_TABLE", "raw.order_cdc_events"))
     } yield PclSettings(
       runId = runId,
       sourceId = sourceId,

@@ -5,9 +5,7 @@ require "net/http"
 require "open3"
 require "uri"
 
-# Service orchestration. Every external command is invoked with an argv array via
-# Open3/System, never a shell string, and readiness is decided by real probes
-# (HTTP endpoints, SQL round-trips, broker API) rather than fixed sleeps.
+# Service orchestration with argv calls and real readiness probes.
 module Infra
   READY_TIMEOUT = 240
   POLL_INTERVAL = 2
@@ -17,16 +15,14 @@ module Infra
   # --- Compose plumbing ------------------------------------------------------
 
   def compose(*args)
-    # -p keeps the project (and therefore the network name) stable so the Beam
-    # application can attach to `pcl_default` without guessing.
+    # Stable project name so the network stays `pcl_default`.
     run!(
       "podman", "compose", "-p", "pcl",
       "-f", File.join(Config::ROOT, "compose.yaml"), *args
     )
   end
 
-  # Run a one-shot client container on the Compose network, returning stdout.
-  # Host tooling requirements stay at zero: no psql or kafka-topics.sh needed.
+  # Run a one-shot client container on the Compose network.
   def capture(image, *args, environment: {})
     env_args = environment.keys.flat_map { |name| ["-e", name] }
     stdout, stderr, status = Open3.capture3(
@@ -107,13 +103,7 @@ module Infra
     false
   end
 
-  # --- Polaris ---------------------------------------------------------------
-  #
-  # Polaris exposes the catalog API on 8181 and a Quarkus management/health API
-  # on 8182. The catalog itself is created by the one-shot `polaris-setup`
-  # container, so readiness is not just "the process is up": we authenticate and
-  # confirm the `pcl` catalog exists before any Iceberg client connects.
-
+  # Polaris catalog (8181) plus Quarkus health (8182); the catalog must exist.
   def polaris_token(env = Config.load_env!)
     port = env.fetch("PCL_ICEBERG_CATALOG_PORT")
     uri = URI("http://localhost:#{port}/api/catalog/v1/oauth/tokens")
@@ -132,11 +122,8 @@ module Infra
     nil
   end
 
-  # Create the Polaris database/schema when upgrading an existing Postgres
-  # volume. The init script only runs on a brand-new volume, and Polaris refuses
-  # to start if its schema is missing.
-  # Create a Postgres database if it does not exist yet. The init scripts only
-  # run on a brand-new volume, so an existing stack is upgraded in place.
+  # Create a Postgres database if it does not exist (init scripts only run on a
+  # brand-new volume, so an existing stack is upgraded in place).
   def ensure_database!(name, env = Config.load_env!)
     password = env.fetch("PCL_POSTGRES_PASSWORD")
     user = env.fetch("PCL_POSTGRES_USER")
@@ -227,19 +214,13 @@ module Infra
   end
 end
 
-# --- Trino client ------------------------------------------------------------
-#
-# Trino is the serving layer. This client only reads: the engine's read-only
-# access control is the real boundary, and the keyword allowlist below fails
-# fast with a clearer message.
+# Trino client. The engine's read-only access control is the boundary; the
+# keyword allowlist here just fails fast with a clearer message.
 module Trino
   READ_ONLY_KEYWORDS = %w[SELECT WITH SHOW DESCRIBE DESC EXPLAIN VALUES TABLE].freeze
 
   module_function
 
-  # `user` selects the Trino identity. Normal queries run as `pcl` (read-only);
-  # only the serving-view DDL runs as `pcl-provisioner`, which the file-based
-  # access control allows to own `serving.orders_current`.
   def execute(sql, env = Config.load_env!, user: "pcl")
     base = "http://localhost:#{env.fetch('PCL_TRINO_PORT')}/v1/statement"
     uri = URI(base)
@@ -271,9 +252,7 @@ module Trino
       payload = JSON.parse(response.body)
       query_id ||= payload["id"]
 
-      # A failed query still returns HTTP 200 with an `error` payload, so the
-      # status code alone would silently treat failures as success. That would
-      # make reconciliation report a clean bill of health on broken data.
+      # Errors arrive as HTTP 200 with an `error` payload.
       if payload["error"]
         detail = payload.dig("error", "message").to_s
         code = payload.dig("error", "errorCode").to_s
@@ -317,25 +296,18 @@ module Trino
       abort(<<~MSG)
         query:file is read-only and cannot run #{keyword.empty? ? 'an empty statement' : keyword}.
         Allowed: #{READ_ONLY_KEYWORDS.join(', ')}.
-        Table writes belong to Spark: rake lakehouse:init, lakehouse:merge, lakehouse:materialize, lakehouse:replay.
-        The serving view belongs to Trino: rake lakehouse:serve.
+        All table writes belong to Spark or Flink: rake lakehouse:init, lakehouse:materialize, lakehouse:correct-serving, lakehouse:replay.
+        Trino never writes, defines views, or merges layers at query time.
       MSG
     end
   end
 
-  # Human-readable label for a statement: the numbered section heading of its
-  # leading comment block when there is one, otherwise its first descriptive
-  # line. Separator lines (`-- ----`) are ignored. Preferring the numbered
-  # heading keeps `reconciliation.sql` labels stable even though the first
-  # statement also carries the file-level header comment.
+  # Label a statement by its numbered section heading, else its first line.
   def statement_label(statement)
     lines = statement.lines.map(&:strip)
     first_code = lines.index { |line| !line.empty? && !line.start_with?("--") } || lines.length
     candidates = []
 
-    # Walk up from the first SQL line so the label comes from the comment block
-    # that immediately precedes the statement, not from a file-level header
-    # separated from it by a blank line.
     (first_code - 1).downto(0) do |index|
       line = lines[index]
       next if line.empty?
@@ -353,9 +325,7 @@ module Trino
     candidates.first || lines.reject(&:empty?).first.to_s[0, 80]
   end
 
-  # Split SQL files without treating semicolons in comments or quoted strings
-  # as statement terminators. Trino's statement endpoint accepts one statement
-  # per request, while our bootstrap and reconciliation files contain several.
+  # Split on semicolons, ignoring comments and quoted strings.
   def split_statements(sql)
     statements = []
     current = +""
@@ -414,10 +384,31 @@ module Trino
   end
 end
 
-# --- Spark batch transformation client ---------------------------------------
+# --- Flink REST client --------------------------------------------------------
 #
-# Spark owns DDL, the incremental MERGE and replay. It runs as a one-shot
-# `spark-sql` container on the Compose network; there is no long-lived cluster.
+# The speed layer is submitted outside Dagster. Rake only needs to read the job
+# list, so a restart cannot silently submit a second serving writer that
+# upserts the same table.
+module Flink
+  module_function
+
+  def rest_url(env = Config.load_env!)
+    "http://localhost:#{env.fetch('PCL_FLINK_WEB_PORT', '8081')}"
+  end
+
+  def jobs(env = Config.load_env!)
+    payload = JSON.parse(Net::HTTP.get(URI("#{rest_url(env)}/jobs/overview")))
+    payload.fetch("jobs", [])
+  rescue StandardError
+    []
+  end
+
+  def running?(name, env = Config.load_env!)
+    jobs(env).any? { |job| job["name"] == name && job["state"] == "RUNNING" }
+  end
+end
+
+# Spark batch client: one-shot `spark-sql` container on the Compose network.
 module Spark
   SQL_MOUNT = "/opt/pcl/sql"
   CONF_MOUNT = "/opt/pcl/conf"
@@ -446,8 +437,7 @@ module Spark
     run_sql(File.read(path), name: File.basename(path, ".sql"), env: env)
   end
 
-  # The rendered script is kept under .local/ so the exact SQL that ran is
-  # available for debugging.
+  # Keep the exact SQL that ran for debugging.
   def run_sql(sql, name:, env: Config.load_env!)
     ensure_image!(env)
     Config.render_spark_conf!(env)
@@ -488,9 +478,7 @@ namespace :infra do
     env = Config.load_env!
     Config.render_trino_catalog!(env)
 
-    # Two-phase start: Postgres first, because Polaris needs its database and
-    # schema to exist before it can connect. The init scripts only run on a
-    # brand-new volume, so this also upgrades an existing volume in place.
+    # Postgres first: Polaris needs its database and schema to exist.
     Infra.compose("up", "--build", "-d", "postgres")
     Infra.wait_until!("Postgres") { Infra.postgres_ready? }
     Infra.ensure_polaris_database!(env)

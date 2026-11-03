@@ -2,12 +2,12 @@
 
 Dagster does not reimplement the lakehouse logic: it renders the same SQL, runs
 the same pinned images, and passes the same environment. `rake` stays the manual
-and test path, this module is the scheduled one.
+and test path, this module is the scheduled one. The continuous speed and serving
+writers are Flink jobs started by Rake, not steps in this graph.
 """
 
 import json
 import re
-import uuid
 from pathlib import Path
 
 import requests
@@ -17,9 +17,6 @@ from .resources import Podman
 
 SPARK_CONF = ".local/spark/spark-defaults.conf"
 SPARK_WORK_DIR = ".local/spark/work"
-PIPELINE_ENV = ".local/dagster/pipeline.env"
-BUILD_VOLUME = "pcl-build-target"
-PIPELINE_JAR = "/scala-2.13/pcl-pipeline.jar"
 
 # Placeholders in spark-defaults.conf.template and the fallback Rake uses when
 # .env does not set them.
@@ -103,95 +100,12 @@ def spark_metrics(output: str) -> dict[str, int]:
     """Pick up the `metric<TAB>value` rows the SQL scripts select."""
     metrics: dict[str, int] = {}
     pattern = re.compile(
-        r"^(changed_keys|projected_keys|landing_rows|landing_events|"
-        r"landing_duplicates|raw_rows|raw_event_ids|landing_remaining|"
-        r"speed_rows|speed_event_ids|speed_stale)\s+(\d+)$"
+        r"^(changed_keys|projected_keys|serving_rows|serving_live)\s+(\d+)$"
     )
     for line in output.splitlines():
         match = pattern.match(line.strip())
         if match:
             metrics[match.group(1)] = int(match.group(2))
-    return metrics
-
-
-def ensure_pipeline_jar(podman: Podman) -> None:
-    """The jar is a build artifact, not an operational step: fail with the fix."""
-    if not podman.volume_file_exists(BUILD_VOLUME, PIPELINE_JAR):
-        raise RuntimeError(
-            "pcl-pipeline.jar is missing from the pcl-build-target volume. "
-            "Build it once with `rake assembly`."
-        )
-
-
-def run_beam(podman: Podman, max_records: int) -> dict[str, int]:
-    """Read at most `max_records` from Kafka and append them to the landing table.
-
-    The bounded read stops exactly at the offset snapshot taken before the run,
-    which is what lets the caller advance the consumer group afterwards.
-    """
-    settings = {
-        "PCL_RUN_ID": str(uuid.uuid4()),
-        "PCL_SOURCE_ID": env("PCL_SOURCE_ID", "pg-local-1"),
-        "PCL_KAFKA_BOOTSTRAP_SERVERS": env("PCL_KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
-        "PCL_CDC_TOPIC": env("PCL_CDC_TOPIC", "pcl.public.orders"),
-        "PCL_ICEBERG_CATALOG_URI": env(
-            "PCL_ICEBERG_CATALOG_URI", "http://polaris:8181/api/catalog"
-        ),
-        "PCL_ICEBERG_WAREHOUSE": env("PCL_ICEBERG_WAREHOUSE", "pcl"),
-        "PCL_POLARIS_CLIENT_ID": env("PCL_POLARIS_CLIENT_ID", "root"),
-        "PCL_POLARIS_CLIENT_SECRET": env("PCL_POLARIS_CLIENT_SECRET"),
-        "PCL_MINIO_ENDPOINT": env("PCL_MINIO_ENDPOINT", "http://minio:9000"),
-        "PCL_MINIO_REGION": env("PCL_MINIO_REGION"),
-        "PCL_MINIO_ROOT_USER": env("PCL_MINIO_ROOT_USER"),
-        "PCL_MINIO_ROOT_PASSWORD": env("PCL_MINIO_ROOT_PASSWORD"),
-        "PCL_PRIMARY_KEY_COLUMNS": env("PCL_PRIMARY_KEY_COLUMNS", "order_id"),
-        "PCL_WRITE_FREQUENCY_SECONDS": env("PCL_WRITE_FREQUENCY_SECONDS", "10"),
-        "PCL_MAX_RECORDS": str(max_records),
-        # The batch layer owns its own consumer group and leaves offsets to
-        # Dagster, which commits them only after the canonical merge.
-        "PCL_PIPELINE_LAYER": "batch",
-        "PCL_CONSUMER_GROUP": f"pcl-batch-{env('PCL_SOURCE_ID', 'pg-local-1')}",
-        "PCL_TARGET_TABLE": "raw.order_cdc_events_landing",
-        "PCL_COMMIT_OFFSETS": "false",
-    }
-
-    # Credentials travel in a file, never on the command line.
-    env_file = WORKSPACE / PIPELINE_ENV
-    env_file.parent.mkdir(parents=True, exist_ok=True)
-    env_file.write_text(
-        "".join(f"{key}={value}\n" for key, value in settings.items()), encoding="utf-8"
-    )
-    env_file.chmod(0o600)
-
-    output = podman.run(
-        "run",
-        "--rm",
-        "--network",
-        podman.network,
-        "--env-file",
-        str(env_file),
-        "-v",
-        f"{BUILD_VOLUME}:/workspace/target:ro",
-        "-w",
-        "/workspace",
-        "--entrypoint",
-        "java",
-        env("PCL_SBT_IMAGE"),
-        "-jar",
-        f"/workspace/target/scala-2.13/pcl-pipeline.jar",
-    )
-    return beam_metrics(output)
-
-
-def beam_metrics(output: str) -> dict[str, int]:
-    """The pipeline prints one JSON object per metric when it finishes."""
-    metrics: dict[str, int] = {}
-    for line in output.splitlines():
-        if not line.startswith('{"component":"CdcStreamingPipeline"'):
-            continue
-        payload = json.loads(line)
-        if "metric" in payload:
-            metrics[payload["metric"]] = int(payload["value"])
     return metrics
 
 

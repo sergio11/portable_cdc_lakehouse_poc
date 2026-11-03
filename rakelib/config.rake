@@ -3,30 +3,20 @@
 require "fileutils"
 require "securerandom"
 
-# Single source of truth for toolchain / container pins used by Rake tasks.
-# Keep these versions aligned with build.sbt and compose.yaml.
+# Toolchain and container pins for Rake tasks.
 module Config
   ROOT = File.expand_path("..", __dir__)
 
-  # sbt + Scala + JDK, fully pinned. Tag format: eclipse-temurin-<jdk>_<sbt>_<scala>
-  # The tag also lives in .env (PCL_SBT_IMAGE) so the Dagster image runs the
-  # assembled jar on exactly the same JVM as the Rake tasks.
   SBT_IMAGE_DEFAULT = "docker.io/sbtscala/scala-sbt:eclipse-temurin-21.0.12_8_1.13.0_2.13.18"
 
-  # Named volumes keep sbt's build output on the container's native filesystem.
-  # The Windows/WSL bind mount rejects the file-timestamp writes sbt performs in
-  # its incremental caches, and native volumes are also markedly faster.
+  # Native volumes: the Windows bind mount rejects sbt's timestamp writes.
   BUILD_VOLUME = "pcl-build"
 
-  # Local cache volumes so dependency resolution survives across runs without
-  # writing anything into the host working tree beyond target/.
   SBT_CACHE_VOLUME = "pcl-sbt-cache"
   IVY_CACHE_DIR    = "/root/.ivy2"
   SBT_CACHE_DIR    = "/root/.sbt"
   COURSIER_DIR     = "/root/.cache/coursier"
 
-  # --- Service images, pinned to exact tags (never `latest`) -----------------
-  # Pinned versions used by the local stack.
   POSTGRES_IMAGE = "docker.io/library/postgres:17.2-bookworm"
   KAFKA_IMAGE    = "docker.io/apache/kafka:3.9.1"
   DEBEZIUM_IMAGE = "quay.io/debezium/connect:3.2.4.Final"
@@ -38,21 +28,19 @@ module Config
   POLARIS_VERSION = "1.8.0"
   POLARIS_IMAGE  = "docker.io/apache/polaris:#{POLARIS_VERSION}"
 
+  # Iceberg 1.12 is the first release with a Flink 2.2 runtime.
+  FLINK_DEFAULT_VERSION = "2.2.1"
+  FLINK_DEFAULT_VARIANT = "java21"
+  ICEBERG_FLINK_DEFAULT_VERSION = "1.12.0"
+
   MINIO_ENDPOINT = "http://minio:9000"
   TRINO_CATALOG_TEMPLATE = File.join(ROOT, "infra", "trino", "etc", "catalog", "iceberg.properties.template")
   TRINO_CATALOG_OUTPUT = File.join(ROOT, ".local", "trino", "catalog", "iceberg.properties")
-  # The serving view stores its SQL with the Spark catalog name (`pcl`). Trino
-  # needs a catalog with that exact name to resolve the view body, so the same
-  # Polaris catalog is registered twice: `iceberg` for existing queries and
-  # `pcl` for Iceberg views created by Spark.
-  TRINO_CATALOG_OUTPUT_PCL = File.join(ROOT, ".local", "trino", "catalog", "pcl.properties")
+  FLINK_SERVING_TEMPLATE = File.join(ROOT, "sql", "flink", "serving.sql")
+  FLINK_SERVING_OUTPUT = File.join(ROOT, ".local", "flink", "serving.sql")
   PIPELINE_ENV_OUTPUT = File.join(ROOT, ".local", "pipeline.env")
 
-  # --- Spark (batch transformation layer) ------------------------------------
-  # Spark is a one-shot CLI image, not a long-running service. The Iceberg
-  # runtime must match the base image line (Spark 3.5 / Scala 2.12). Versions are
-  # mirrored in compose.yaml so the image tag built by Compose is the same one
-  # Rake runs.
+  # One-shot Spark CLI; runtime must match Spark 3.5 / Scala 2.12.
   SPARK_DEFAULT_VERSION = "3.5.9"
   SPARK_DEFAULT_ICEBERG_VERSION = "1.11.0"
   SPARK_DEFAULT_DRIVER_MEMORY = "1g"
@@ -110,16 +98,31 @@ module Config
     replacements.each { |key, value| template = template.gsub("__#{key}__", value) }
 
     FileUtils.mkdir_p(File.dirname(TRINO_CATALOG_OUTPUT))
-    [TRINO_CATALOG_OUTPUT, TRINO_CATALOG_OUTPUT_PCL].each do |output|
-      File.open(output, "w", 0o600) { |file| file.write(template) }
-    end
+    File.open(TRINO_CATALOG_OUTPUT, "w", 0o600) { |file| file.write(template) }
   end
 
-  # Create a one-run env file for the Beam container so credentials are never
-  # embedded in the podman command line or written to a tracked file.
+  # Output under .local/ because it carries the Polaris secret.
+  def self.render_flink_serving!(env = load_env!)
+    template = File.read(FLINK_SERVING_TEMPLATE)
+    replacements = {
+      "PCL_ICEBERG_WAREHOUSE" => env.fetch("PCL_ICEBERG_WAREHOUSE", "pcl"),
+      "PCL_POLARIS_CLIENT_ID" => env.fetch("PCL_POLARIS_CLIENT_ID", "root"),
+      "PCL_POLARIS_CLIENT_SECRET" => env.fetch("PCL_POLARIS_CLIENT_SECRET"),
+      "PCL_MINIO_REGION" => env.fetch("PCL_MINIO_REGION"),
+      "PCL_MINIO_ROOT_USER" => env.fetch("PCL_MINIO_ROOT_USER"),
+      "PCL_MINIO_ROOT_PASSWORD" => env.fetch("PCL_MINIO_ROOT_PASSWORD")
+    }
+    replacements.each { |key, value| template = template.gsub("__#{key}__", value) }
+
+    FileUtils.mkdir_p(File.dirname(FLINK_SERVING_OUTPUT))
+    File.open(FLINK_SERVING_OUTPUT, "w", 0o600) { |file| file.write(template) }
+    FLINK_SERVING_OUTPUT
+  end
+
+  # One-run env file: credentials never reach argv or a tracked file.
   def self.render_pipeline_env!(env = load_env!)
     settings = {
-      "PCL_RUN_ID" => SecureRandom.uuid,
+      "PCL_RUN_ID" => env.fetch("PCL_RUN_ID", SecureRandom.uuid),
       "PCL_SOURCE_ID" => env.fetch("PCL_SOURCE_ID"),
       "PCL_KAFKA_BOOTSTRAP_SERVERS" => env.fetch("PCL_KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
       "PCL_CDC_TOPIC" => env.fetch("PCL_CDC_TOPIC", "pcl.public.orders"),
@@ -133,7 +136,12 @@ module Config
       "PCL_MINIO_ROOT_PASSWORD" => env.fetch("PCL_MINIO_ROOT_PASSWORD"),
       "PCL_PRIMARY_KEY_COLUMNS" => env.fetch("PCL_PRIMARY_KEY_COLUMNS", "order_id"),
       "PCL_WRITE_FREQUENCY_SECONDS" => env.fetch("PCL_WRITE_FREQUENCY_SECONDS", "10"),
-      "PCL_MAX_RECORDS" => env.fetch("PCL_MAX_RECORDS", "0")
+      "PCL_MAX_RECORDS" => env.fetch("PCL_MAX_RECORDS", "0"),
+      # Layer picks the consumer group; the bounded run leaves offsets alone.
+      "PCL_PIPELINE_LAYER" => env.fetch("PCL_PIPELINE_LAYER", "batch"),
+      "PCL_CONSUMER_GROUP" => env.fetch("PCL_CONSUMER_GROUP", ""),
+      "PCL_TARGET_TABLE" => env.fetch("PCL_TARGET_TABLE", "raw.order_cdc_events"),
+      "PCL_COMMIT_OFFSETS" => env.fetch("PCL_COMMIT_OFFSETS", "false")
     }
 
     FileUtils.mkdir_p(File.dirname(PIPELINE_ENV_OUTPUT))
@@ -149,6 +157,14 @@ module Config
     version = env.fetch("PCL_SPARK_VERSION", SPARK_DEFAULT_VERSION)
     iceberg = env.fetch("PCL_SPARK_ICEBERG_VERSION", SPARK_DEFAULT_ICEBERG_VERSION)
     "localhost/pcl-spark:#{version}-iceberg-#{iceberg}"
+  end
+
+  # Image tag built by Compose from infra/flink and used by both Flink services.
+  def self.flink_image(env = load_env!)
+    version = env.fetch("PCL_FLINK_VERSION", FLINK_DEFAULT_VERSION)
+    variant = env.fetch("PCL_FLINK_VARIANT", FLINK_DEFAULT_VARIANT)
+    iceberg = env.fetch("PCL_ICEBERG_FLINK_VERSION", ICEBERG_FLINK_DEFAULT_VERSION)
+    "localhost/pcl-flink:#{version}-#{variant}-iceberg-#{iceberg}"
   end
 
   # JVM used to run the assembled pipeline jar. Defaults without requiring .env,

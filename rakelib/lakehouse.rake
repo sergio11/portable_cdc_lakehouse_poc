@@ -67,39 +67,13 @@ end
 
 namespace :lakehouse do
   SPARK_SQL_DIR = File.join(Config::ROOT, "sql", "spark")
-  SERVING_SQL = File.join(Config::ROOT, "sql", "serving", "serving_view.sql")
 
-  # Iceberg stores one SQL representation per engine dialect, and Trino refuses
-  # a view written in Spark's dialect. The serving view is therefore defined by
-  # Trino itself, through the dedicated provisioning identity; every table write
-  # still belongs to Spark.
-  def create_serving_view(env)
-    Trino.execute_file(SERVING_SQL, env, user: "pcl-provisioner")
-  end
-
-  desc "Create the Iceberg schemas, tables and serving view (raw / silver / speed / serving / ops)"
+  desc "Create the Iceberg schemas and tables (raw / silver / serving / ops)"
   task :init do
     env = Config.load_env!
     Infra.ensure_iceberg_bucket!(env)
     Spark.run_file(File.join(SPARK_SQL_DIR, "bootstrap_catalog.sql"), env)
-    create_serving_view(env)
-    puts "Iceberg tables and the serving view are ready (Spark for tables, Trino for the view)."
-  end
-
-  desc "Create or refresh the lambda serving view over batch and speed"
-  task :serve do
-    env = Config.load_env!
-    Infra.ensure_iceberg_bucket!(env)
-    create_serving_view(env)
-    puts "Serving view refreshed: pcl.serving.orders_current."
-  end
-
-  desc "Release speed-layer deliveries already canonical in raw"
-  task :"compact-speed" do
-    env = Config.load_env!
-    Infra.ensure_iceberg_bucket!(env)
-    Spark.run_file(File.join(SPARK_SQL_DIR, "compact_speed.sql"), env)
-    puts "Speed layer compacted against canonical raw."
+    puts "Iceberg tables are ready (raw, silver, serving, ops)."
   end
 
   desc "Describe the Iceberg tables, snapshots, and incremental watermark"
@@ -109,7 +83,7 @@ namespace :lakehouse do
     statements = {
       "tables" => <<~SQL,
         SELECT table_schema, table_name FROM information_schema.tables
-         WHERE table_schema IN ('raw','silver','speed','serving','ops')
+         WHERE table_schema IN ('raw','silver','serving','ops')
          ORDER BY table_schema, table_name
       SQL
       "current-state snapshots" => <<~SQL,
@@ -121,20 +95,22 @@ namespace :lakehouse do
           FROM ops.materialization_state ORDER BY target_table
       SQL
       "raw invariants" => <<~SQL,
-        SELECT 'raw_rows' AS metric, count(*) AS value FROM raw.order_cdc_events
+        SELECT 'raw_deliveries' AS metric, count(*) AS value FROM raw.order_cdc_events
         UNION ALL
-        SELECT 'raw_event_ids', count(DISTINCT event_id) FROM raw.order_cdc_events
+        SELECT 'raw_events', count(DISTINCT event_id) FROM raw.order_cdc_events
         UNION ALL
-        SELECT 'landing_rows', count(*) FROM raw.order_cdc_events_landing
+        SELECT 'raw_duplicate_deliveries',
+               count(*) - count(DISTINCT event_id) FROM raw.order_cdc_events
       SQL
       "lambda layers" => <<~SQL
-        SELECT 'speed_rows' AS metric, count(*) AS value FROM speed.order_cdc_events
-        UNION ALL
-        SELECT 'speed_event_ids', count(DISTINCT event_id) FROM speed.order_cdc_events
-        UNION ALL
-        SELECT 'batch_keys', count(*) FROM silver.orders_current
+        SELECT 'silver_keys' AS metric, count(*) AS value FROM silver.orders_current
         UNION ALL
         SELECT 'serving_keys', count(*) FROM serving.orders_current
+        UNION ALL
+        SELECT 'serving_behind_silver',
+               count(*) FROM serving.orders_current s
+                JOIN silver.orders_current b ON b.order_id = s.order_id
+               WHERE b.last_lsn > s.last_lsn
       SQL
     }
 
@@ -148,16 +124,8 @@ namespace :lakehouse do
     end
   end
 
-  desc "Merge landing deliveries into raw, keeping one row per event_id"
-  task :merge do
-    env = Config.load_env!
-    Infra.ensure_iceberg_bucket!(env)
-    Spark.run_file(File.join(SPARK_SQL_DIR, "merge_raw.sql"), env)
-    puts "Raw history merged (spark-sql, catalog pcl)."
-  end
-
-  desc "Incrementally merge new raw CDC events into silver.orders_current with Spark"
-  task :materialize => :merge do
+  desc "Incrementally project the event log into silver.orders_current and correct serving"
+  task :materialize do
     env = Config.load_env!
     Infra.ensure_iceberg_bucket!(env)
     sql = Spark.expand_template(
@@ -165,9 +133,16 @@ namespace :lakehouse do
       target: "pcl.silver.orders_current"
     )
     Spark.run_sql(sql, name: "materialize_orders", env: env)
-    Spark.run_file(File.join(SPARK_SQL_DIR, "compact_speed.sql"), env)
-    create_serving_view(env)
-    puts "Batch view refreshed, speed compacted, serving view updated (Spark for tables, Trino for the view)."
+    Spark.run_file(File.join(SPARK_SQL_DIR, "correct_serving.sql"), env)
+    puts "silver.orders_current refreshed and serving.orders_current corrected."
+  end
+
+  desc "Overwrite serving rows whose canonical silver position is newer or equal"
+  task :"correct-serving" do
+    env = Config.load_env!
+    Infra.ensure_iceberg_bucket!(env)
+    Spark.run_file(File.join(SPARK_SQL_DIR, "correct_serving.sql"), env)
+    puts "serving.orders_current corrected from canonical silver."
   end
 
   desc "Replay raw CDC history into an isolated table: PCL_REPLAY_ID=run1 [PCL_REPLAY_FROM_LSN=..] [PCL_REPLAY_TO_LSN=..]"

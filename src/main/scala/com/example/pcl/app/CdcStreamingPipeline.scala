@@ -24,8 +24,8 @@ import java.time.LocalDateTime
 import java.time.ZoneOffset
 import scala.jdk.CollectionConverters._
 
-/** Shared Beam graph for reading Kafka CDC, validating events, and landing accepted rows in Iceberg
-  * or routing invalid ones to the dead-letter table.
+/** Shared Beam graph for reading Kafka CDC, validating events, and appending accepted rows to the
+  * append-only Iceberg event log, or routing invalid ones to the dead-letter table.
   */
 object CdcStreamingPipeline {
 
@@ -138,8 +138,8 @@ object CdcStreamingPipeline {
           .withMaxReadTime(org.joda.time.Duration.standardSeconds(60))
       else kafkaRead
     // The speed layer runs unbounded on Flink and owns its offsets: KafkaIO commits the
-    // checkpointed positions to the speed consumer group after the Iceberg append. The batch
-    // layer keeps offsets uncommitted here and lets Dagster commit them after the canonical merge.
+    // checkpointed positions to the speed consumer group after the Iceberg append. The bounded
+    // manual run uses a separate consumer group and leaves offsets uncommitted.
     val positionedRead =
       if (settings.commitOffsets) limitedRead.commitOffsetsInFinalize() else limitedRead
 
@@ -154,16 +154,16 @@ object CdcStreamingPipeline {
         .withOutputTags(RawTag, TupleTagList.of(DeadLetterTag))
     )
 
-    val landingWriter = IcebergIO
+    val eventWriter = IcebergIO
       .writeRows(catalog)
       .to(tableIdentifier(settings.targetTable))
     val deadLetterWriter = IcebergIO
       .writeRows(catalog)
       .to(TableIdentifier.of("ops", "cdc_dead_letter"))
-    val configuredLandingWriter =
-      if (settings.maxRecords > 0) landingWriter
+    val configuredEventWriter =
+      if (settings.maxRecords > 0) eventWriter
       else
-        landingWriter.withTriggeringFrequency(
+        eventWriter.withTriggeringFrequency(
           org.joda.time.Duration.standardSeconds(settings.writeFrequencySeconds)
         )
     val configuredDeadLetterWriter =
@@ -176,7 +176,7 @@ object CdcStreamingPipeline {
     routed
       .get(RawTag)
       .setRowSchema(RawSchema)
-      .apply(s"Append ${settings.pipelineLayer} deliveries", configuredLandingWriter)
+      .apply(s"Append ${settings.pipelineLayer} deliveries", configuredEventWriter)
     routed
       .get(DeadLetterTag)
       .setRowSchema(DeadLetterSchema)

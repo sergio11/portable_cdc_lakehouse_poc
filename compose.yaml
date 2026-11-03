@@ -1,28 +1,10 @@
-# ---------------------------------------------------------------------------
-# Portable CDC Lakehouse — local lakehouse stack.
-#
-# Design notes
-#   * Every image uses a pinned tag for reproducible local runs.
-#   * Networking is deliberately conservative. Kafka advertises only its
-#     in-network address (`kafka:9092`) and is NOT published to the host, so
-#     there is a single unambiguous address for clients. The Beam application
-#     joins this network and therefore uses the same value; publishing the port
-#     would force an advertised-listener split between host and container
-#     clients, which is a classic source of silent misconfiguration.
-#   * MinIO provides S3-compatible object storage for the Iceberg warehouse.
-#     Beam, Spark and Trino use the same endpoint, bucket and credentials.
-#   * Postgres runs with logical WAL decoding enabled for Debezium.
-#
-# Usage is always through Rake (`rake infra:up`), never by calling
-# `podman compose` by hand, so that readiness is awaited and errors are clear.
-# ---------------------------------------------------------------------------
+# Portable CDC lakehouse stack. Usage through Rake (`rake infra:up`).
 
 services:
 
   postgres:
     image: docker.io/library/postgres:17.2-bookworm
     container_name: pcl-postgres
-    # Debezium reads PostgreSQL changes from the logical WAL.
     command:
       - postgres
       - -c
@@ -35,11 +17,9 @@ services:
       POSTGRES_DB: ${PCL_POSTGRES_DB}
       POSTGRES_USER: ${PCL_POSTGRES_USER}
       POSTGRES_PASSWORD: ${PCL_POSTGRES_PASSWORD}
-      # Deterministic collation so fixture ordering does not depend on the host.
       POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Source schema is applied once, on first initialisation of an empty volume.
       - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
     ports:
       - "127.0.0.1:${PCL_POSTGRES_PORT}:5432"
@@ -53,8 +33,6 @@ services:
   kafka:
     image: docker.io/apache/kafka:3.9.1
     container_name: pcl-kafka
-    # Single-node KRaft: this node is both broker and controller. Sufficient for
-    # a POC and avoids ZooKeeper entirely.
     environment:
       CLUSTER_ID: ${PCL_KAFKA_CLUSTER_ID}
       KAFKA_NODE_ID: "1"
@@ -65,7 +43,6 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      # Single node, so every replication factor collapses to 1.
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
@@ -75,7 +52,6 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
-      # Uses the image's own tooling: no shell interpolation tricks needed.
       test:
         - CMD-SHELL
         - >-
@@ -104,10 +80,7 @@ services:
       - "127.0.0.1:${PCL_MINIO_API_PORT}:9000"
       - "127.0.0.1:${PCL_MINIO_CONSOLE_PORT}:9001"
 
-  # One-shot metastore bootstrap. Since Polaris 1.8.0 the server no longer
-  # creates its own tables, so the admin tool must run `bootstrap` first. It is
-  # idempotent: an already-bootstrapped realm is reported and skipped, which
-  # keeps `rake infra:up` re-runnable.
+  # Polaris 1.8+ requires an explicit metastore bootstrap first.
   polaris-bootstrap:
     image: docker.io/apache/polaris-admin-tool:${PCL_POLARIS_VERSION}
     container_name: pcl-polaris-bootstrap
@@ -129,11 +102,8 @@ services:
       - POLARIS,${PCL_POLARIS_CLIENT_ID},${PCL_POLARIS_CLIENT_SECRET}
     restart: "no"
 
-  # Apache Polaris is the Iceberg REST catalog. Its metastore is the same
-  # PostgreSQL instance (database `polaris`, schema `polaris_schema`), so the
-  # catalog survives container restarts without SQLite or a local file.
-  # `stsUnavailable=true` on the catalog disables credential vending: MinIO does
-  # not implement STS, and Beam/Trino already hold their own S3 credentials.
+  # Iceberg REST catalog backed by the same PostgreSQL server.
+  # stsUnavailable: MinIO has no STS and clients bring their own S3 credentials.
   polaris:
     image: docker.io/apache/polaris:${PCL_POLARIS_VERSION}
     container_name: pcl-polaris
@@ -153,11 +123,7 @@ services:
       QUARKUS_DATASOURCE_PASSWORD: ${PCL_POSTGRES_PASSWORD}
       POLARIS_REALM_CONTEXT_REALMS: POLARIS
       QUARKUS_OTEL_SDK_DISABLED: "true"
-      # Only S3 is allowed. `ALLOW_INSECURE_STORAGE_TYPES` is deliberately NOT
-      # set: it exists for FILE storage, and Polaris treats it as a severe
-      # readiness issue. MinIO needs no STS, which `stsUnavailable` covers.
       polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": '["S3"]'
-      # Polaris needs these to reach MinIO when it inspects or creates metadata.
       AWS_ACCESS_KEY_ID: ${PCL_MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${PCL_MINIO_ROOT_PASSWORD}
       AWS_REGION: ${PCL_MINIO_REGION}
@@ -171,8 +137,7 @@ services:
       retries: 20
       start_period: 30s
 
-  # One-shot catalog bootstrap. Idempotent: it checks for the catalog first and
-  # only creates it when missing, so `rake infra:up` can be re-run safely.
+  # Idempotent catalog bootstrap.
   polaris-setup:
     image: docker.io/alpine/curl:8.22.0
     container_name: pcl-polaris-setup
@@ -204,7 +169,6 @@ services:
       CONFIG_STORAGE_REPLICATION_FACTOR: "1"
       OFFSET_STORAGE_REPLICATION_FACTOR: "1"
       STATUS_STORAGE_REPLICATION_FACTOR: "1"
-      # Debezium reads logical decoding from Postgres as this user.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
     ports:
@@ -214,41 +178,24 @@ services:
     image: docker.io/trinodb/trino:476
     container_name: pcl-trino
     depends_on:
-      # Trino loads the Iceberg catalog at startup; the `pcl` catalog must exist
-      # in Polaris by then, otherwise the connector fails and stays broken.
       polaris-setup:
         condition: service_completed_successfully
     volumes:
-      # Generated from the local .env; contains credentials and is gitignored.
       - ./.local/trino/catalog:/etc/trino/catalog:ro
-      # Trino is the serving layer only. The file-based access control grants
-      # SELECT on the lakehouse catalogs to every client and OWNERSHIP of the
-      # serving view to `pcl-provisioner` alone, so data writes are rejected by
-      # the engine and only the view definition can be managed from Trino.
+      # Read-only: Spark and Flink own every write.
       - ./infra/trino/etc/access-control.properties:/etc/trino/access-control.properties:ro
       - ./infra/trino/etc/access-control-rules.json:/etc/trino/access-control-rules.json:ro
       - trino_data:/var/lib/trino/data
     ports:
       - "127.0.0.1:${PCL_TRINO_PORT}:8080"
     healthcheck:
-      # Trino takes longer to initialise its Iceberg connector on this small
-      # single-node POC than the upstream image's 10 second startup window.
       test: ["CMD-SHELL", "/usr/lib/trino/bin/health-check"]
       interval: 10s
       timeout: 10s
       retries: 12
       start_period: 120s
 
-  # --- Dagster (scheduled orchestration) ------------------------------------
-  #
-  # The webserver only serves the UI and loads the code location, so it needs no
-  # engine access and lives here like any other service. The daemon executes runs
-  # and starts Spark/Beam as sibling containers, so it needs the Podman socket;
-  # `rake dagster:up` starts it with the engine client directly, because
-  # podman-compose rewrites absolute bind sources on Windows and turns the socket
-  # into an empty directory. Bind mounts inside the containers it starts are
-  # resolved by the host engine, so PCL_HOST_WORKSPACE holds the host repository
-  # path.
+  # Webserver serves the UI; the daemon executes runs and needs the Podman socket.
   dagster-webserver:
     image: localhost/pcl-dagster:${PCL_DAGSTER_VERSION:-1.13.27}
     build:
@@ -286,13 +233,7 @@ services:
       retries: 12
       start_period: 20s
 
-  # Apache Spark is the batch transformation layer: it owns the Iceberg DDL, the
-  # incremental MERGE into silver, and the replay rebuild. Trino never writes.
-  #
-  # This is a one-shot CLI image, not a long-running service: Rake starts
-  # `spark-sql`, runs a script against Polaris and exits. The `tools` profile
-  # keeps it out of `rake infra:up`; the service exists so the image is built
-  # from Compose with the same pinned versions as the rest of the stack.
+  # One-shot Spark CLI image: Rake runs spark-sql against Polaris and exits.
   spark:
     image: localhost/pcl-spark:${PCL_SPARK_VERSION:-3.5.9}-iceberg-${PCL_SPARK_ICEBERG_VERSION:-1.11.0}
     build:
@@ -308,7 +249,13 @@ services:
     profiles: ["tools"]
 
   flink-jobmanager:
-    image: docker.io/library/flink:2.2.1-java21
+    image: localhost/pcl-flink:${PCL_FLINK_VERSION:-2.2.1}-${PCL_FLINK_VARIANT:-java21}-iceberg-${PCL_ICEBERG_FLINK_VERSION:-1.12.0}
+    build:
+      context: ./infra/flink
+      args:
+        FLINK_VERSION: ${PCL_FLINK_VERSION:-2.2.1}
+        FLINK_VARIANT: ${PCL_FLINK_VARIANT:-java21}
+        ICEBERG_VERSION: ${PCL_ICEBERG_FLINK_VERSION:-1.12.0}
     container_name: pcl-flink-jobmanager
     command: jobmanager
     environment:
@@ -329,13 +276,7 @@ services:
       - "127.0.0.1:${PCL_FLINK_WEB_PORT:-8081}:8081"
     profiles: ["flink"]
 
-  # --- Lambda speed layer -----------------------------------------------------
-  #
-  # The speed job is deliberately not part of the Dagster graph: it runs
-  # continuously on Flink, with its own consumer group and checkpointed Kafka
-  # offsets, and appends to `speed.order_cdc_events`. It never writes canonical
-  # `raw`; Spark owns that boundary. Restarting it replays from the last
-  # checkpoint/committed offset, and the serving view absorbs duplicates.
+  # Speed layer: outside the Dagster graph. Beam appends to the raw log.
   pipeline-speed:
     image: ${PCL_SBT_IMAGE:-docker.io/sbtscala/scala-sbt:eclipse-temurin-21.0.12_8_1.13.0_2.13.18}
     container_name: pcl-pipeline-speed
@@ -351,7 +292,7 @@ services:
       PCL_RUN_ID: speed
       PCL_PIPELINE_LAYER: speed
       PCL_CONSUMER_GROUP: pcl-speed-${PCL_SOURCE_ID}
-      PCL_TARGET_TABLE: speed.order_cdc_events
+      PCL_TARGET_TABLE: raw.order_cdc_events
       PCL_COMMIT_OFFSETS: "true"
       PCL_MAX_RECORDS: "0"
     volumes:
@@ -368,8 +309,37 @@ services:
     restart: unless-stopped
     profiles: ["speed"]
 
+  # Flink SQL upsert writer; submits detached and exits.
+  pipeline-serving:
+    image: localhost/pcl-flink:${PCL_FLINK_VERSION:-2.2.1}-${PCL_FLINK_VARIANT:-java21}-iceberg-${PCL_ICEBERG_FLINK_VERSION:-1.12.0}
+    container_name: pcl-pipeline-serving
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+    volumes:
+      - ./.local/flink:/opt/pcl/sql:ro
+    entrypoint: ["/opt/flink/bin/sql-client.sh"]
+    command:
+      - embedded
+      - -D
+      - execution.target=remote
+      - -D
+      - rest.address=flink-jobmanager
+      - -D
+      - rest.port=8081
+      - -D
+      - execution.attached=false
+      - -f
+      - /opt/pcl/sql/serving.sql
+    restart: "no"
+    profiles: ["speed"]
+
   flink-taskmanager:
-    image: docker.io/library/flink:2.2.1-java21
+    image: localhost/pcl-flink:${PCL_FLINK_VERSION:-2.2.1}-${PCL_FLINK_VARIANT:-java21}-iceberg-${PCL_ICEBERG_FLINK_VERSION:-1.12.0}
     container_name: pcl-flink-taskmanager
     command: taskmanager
     depends_on:
@@ -377,12 +347,12 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.memory.process.size: 1280m
+        taskmanager.memory.process.size: 2048m
         taskmanager.memory.network.min: 128mb
-        taskmanager.memory.network.max: 128mb
+        taskmanager.memory.network.max: 256mb
         taskmanager.memory.network.fraction: 0.2
         taskmanager.memory.managed.fraction: 0.2
-        taskmanager.numberOfTaskSlots: 1
+        taskmanager.numberOfTaskSlots: 2
         parallelism.default: 1
         state.checkpoints.dir: file:///opt/flink/checkpoints
         state.backend.type: rocksdb
@@ -398,7 +368,5 @@ volumes:
   trino_data:
   flink_checkpoints:
   dagster_home:
-  # Built by `rake assembly`; the speed job mounts the same artifact the batch
-  # path runs, so there is one implementation of the Beam graph.
   pcl-build-target:
     external: true

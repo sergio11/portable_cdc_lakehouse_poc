@@ -74,14 +74,14 @@ class DomainPuritySpec extends AnyFlatSpec with Matchers {
     )
   }
 
-  it should "keep the speed layer on its own consumer group and target table" in {
+  it should "keep the speed layer on its own consumer group and append to the event log" in {
     val result = PclSettings.fromEnv(
       Map(
         "PCL_RUN_ID"         -> "speed",
         "PCL_SOURCE_ID"      -> "pg-1",
         "PCL_PIPELINE_LAYER" -> "speed",
         "PCL_CONSUMER_GROUP" -> "pcl-speed-pg-1",
-        "PCL_TARGET_TABLE"   -> "speed.order_cdc_events",
+        "PCL_TARGET_TABLE"   -> "raw.order_cdc_events",
         "PCL_COMMIT_OFFSETS" -> "true"
       )
     )
@@ -89,12 +89,12 @@ class DomainPuritySpec extends AnyFlatSpec with Matchers {
     result.map(settings =>
       (settings.pipelineLayer, settings.consumerGroup, settings.targetTable, settings.commitOffsets)
     ) shouldBe
-      Right(("speed", "pcl-speed-pg-1", "speed.order_cdc_events", true))
+      Right(("speed", "pcl-speed-pg-1", "raw.order_cdc_events", true))
   }
 
   it should "reject a target table without a namespace" in {
     val result = PclSettings.fromEnv(
-      Map("PCL_RUN_ID" -> "run-1", "PCL_SOURCE_ID" -> "pg-1", "PCL_TARGET_TABLE" -> "landing")
+      Map("PCL_RUN_ID" -> "run-1", "PCL_SOURCE_ID" -> "pg-1", "PCL_TARGET_TABLE" -> "order_cdc_events")
     )
     result shouldBe Left(PclSettings.InvalidTargetTable)
   }
