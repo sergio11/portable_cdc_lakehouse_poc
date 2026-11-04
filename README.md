@@ -24,7 +24,7 @@ Portable CDC Lakehouse is a local Proof of Concept for turning PostgreSQL change
 
 ---
 
-[📋 Disclaimer](#-disclaimer) · [🎯 Project goal](#-project-goal) · [⚖️ Why this architecture](#-why-this-architecture) · [✨ Key highlights](#-key-highlights) · [🏗️ Architecture](#-architecture) · [🗂️ Data model and semantics](#-data-model-and-semantics) · [📸 Results](#-results) · [📜 License](#-license)
+[📋 Disclaimer](#-disclaimer) · [🎯 Project goal](#-project-goal) · [⚖️ Why this architecture](#-why-this-architecture) · [✨ Key highlights](#-key-highlights) · [🏗️ Architecture](#-architecture) · [🗂️ Data model and semantics](#-data-model-and-semantics) · [🧰 Rake tasks](#-rake-tasks) · [📸 Results](#-results) · [📜 License](#-license)
 
 </div>
 
@@ -349,32 +349,62 @@ There is no compaction step. Removing rows from `raw` would create a non-append 
 
 The POC implements the convergence machinery, not a business model. `silver` has no business rules: no status lifecycle, no SCD2, no aggregates, no masking. Reprocessing the log after a change in the **projection logic** is demonstrated; reprocessing after a change in **business rules** uses the same mechanism but is not exercised. That is a deliberate boundary, not a hidden gap: the log, the deterministic projection and the replay path are the parts that are expensive to retrofit, and they are the parts this POC validates.
 
-## 🚀 Quick start
+## 🧰 Rake tasks
 
-From Windows PowerShell, copy `.env.example` to `.env`, set the local PostgreSQL, MinIO, and Polaris passwords, and point `PCL_HOST_WORKSPACE` and `PCL_PODMAN_SOCKET` at this machine (Dagster starts Spark through the host engine). Start the services and prepare the CDC source:
+**Infrastructure**
 
-```powershell
-Copy-Item .env.example .env
-bundle exec rake infra:up          # starts the stack and the Dagster batch daemon
-bundle exec rake lakehouse:init    # raw, silver, serving and ops
-bundle exec rake debezium:register # registers the PostgreSQL connector
-bundle exec rake fixtures:scenarios
-bundle exec rake pipeline:speed:up # Flink cluster + Beam speed + Flink SQL serving
-```
+| Task | Purpose |
+|---|---|
+| `infra:up` | Start the stack and wait until every service is usable |
+| `infra:down` | Stop the stack, keeping volumes |
+| `infra:status` | Show container status |
+| `infra:logs[service]` | Follow the logs of one service |
+| `infra:reset` | Destroy the stack and all volumes, including CDC history |
+| `fixtures:scenarios` | Apply the deterministic CDC scenarios |
 
-`infra:up` starts PostgreSQL first, ensures the `polaris` and `dagster` databases and `polaris_schema` exist, then starts the rest of the stack and finally the Dagster daemon. The one-shot `polaris-setup` container creates the `pcl` catalog idempotently. Polaris listens on `http://localhost:8181/api/catalog`; its health endpoint is `http://localhost:8182/q/health`. The first `lakehouse:init` builds the pinned Spark image locally; later runs reuse it.
+**Lakehouse**
 
-`pipeline:speed:up` builds the Beam jar and the Iceberg-enabled Flink image, starts the Flink JobManager/TaskManager, submits the Beam speed job, and submits the Flink SQL serving job. The speed job uses `pcl-speed-<source>` and appends to `raw.order_cdc_events`; the serving job reads that log and upserts `serving.orders_current`. Both keep running across Dagster runs. The dashboard is [localhost:8081](http://localhost:8081). Stop them with `bundle exec rake pipeline:speed:down`; checkpoints survive, so a later start resumes from durable state.
+| Task | Purpose |
+|---|---|
+| `lakehouse:init` | Create the Iceberg schemas and tables |
+| `lakehouse:describe` | Describe tables, snapshots, watermark and layer counts |
+| `lakehouse:materialize` | Project the log into `silver` and correct `serving` |
+| `lakehouse:correct-serving` | Overwrite serving rows that are behind `silver` |
+| `lakehouse:replay` | Replay history into an isolated table (`PCL_REPLAY_ID`, optional LSN window) |
+| `debezium:register` | Register the PostgreSQL connector |
+| `debezium:status` | Show the connector status |
+| `query:file[path]` | Run a read-only SQL file against Trino |
 
-The Dagster schedule is already running and performs the batch loop every five minutes. The UI is at [localhost:3000](http://localhost:3000): `rake dagster:run` triggers the same job on demand, and `rake dagster:replay[readme_proof]` runs a replay through Dagster.
+**Pipeline**
 
-Query the serving layer:
+| Task | Purpose |
+|---|---|
+| `pipeline:speed:up` | Start Flink, the Beam speed job and the SQL serving job |
+| `pipeline:speed:down` | Stop the speed writers and the Flink cluster |
+| `pipeline:speed:status` | Show the speed writers and cluster status |
+| `pipeline:flink:stop` | Stop the Flink JobManager and TaskManager |
+| `pipeline:direct` | Run the bounded graph with DirectRunner |
 
-```sql
-SELECT * FROM serving.orders_current WHERE NOT is_deleted ORDER BY order_id;
-```
+**Orchestration**
 
-`bundle exec rake lakehouse:materialize` runs the batch projection and the serving correction by hand when you want the batch side immediate; `bundle exec rake query:file[sql/trino/reconciliation.sql]` then inspects the result. A new event appears in `serving` without waiting for Dagster; after the next batch run the same event is authoritative in `silver`, and the correction leaves serving at the same or a newer position.
+| Task | Purpose |
+|---|---|
+| `dagster:up` | Start the webserver and daemon |
+| `dagster:down` | Stop them, keeping run history |
+| `dagster:validate` | Load and validate the code location |
+| `dagster:run` | Trigger one incremental run |
+| `dagster:replay[id,from_lsn,to_lsn]` | Replay through Dagster |
+
+**Build and test**
+
+| Task | Purpose |
+|---|---|
+| `compile` | Compile main and test sources in the build container |
+| `assembly` | Assemble the fat jar |
+| `test:unit` | Run unit and architecture tests |
+| `verify` | Compile, check formatting and run tests |
+| `scalafmt:check` | Verify formatting |
+| `scalafmt:format` | Format sources in place |
 
 ## 📸 Results
 
