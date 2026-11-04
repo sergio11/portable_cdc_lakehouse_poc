@@ -23,6 +23,11 @@ __pycache__/
 !.env.example
 .local/
 
+# --- Local scratch and unpublished drafts ---
+.local-about.txt
+# Remove this line if the article draft is ever committed.
+docs/medium/
+
 # --- IDE ---
 .idea/
 .vscode/
