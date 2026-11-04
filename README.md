@@ -24,7 +24,7 @@ Portable CDC Lakehouse is a local Proof of Concept for turning PostgreSQL change
 
 ---
 
-[📋 Disclaimer](#-disclaimer) · [🎯 Project goal](#-project-goal) · [⚖️ Why this architecture](#-why-this-architecture) · [✨ Key highlights](#-key-highlights) · [🏗️ Architecture](#-architecture) · [🗂️ Data model and semantics](#-data-model-and-semantics) · [🧰 Rake tasks](#-rake-tasks) · [📸 Results](#-results) · [📜 License](#-license)
+[📋 Disclaimer](#-disclaimer) · [🎯 Project goal](#-project-goal) · [⚖️ Why this architecture](#-why-this-architecture) · [✨ Key highlights](#-key-highlights) · [🏗️ Architecture](#-architecture) · [🗂️ Data model](#-data-model) · [🚧 Scope and non-goals](#-scope-and-non-goals) · [🧰 Rake tasks](#-rake-tasks) · [📸 Results](#-results) · [📜 License](#-license)
 
 </div>
 
@@ -326,26 +326,17 @@ Podman runs the services and job containers without requiring Docker Engine. Com
 
 The FlinkRunner artifact family matches Flink 2.2.x, and [Beam's compatibility table](https://beam.apache.org/documentation/runners/flink/) lists support for Beam 2.75.0 and later with that runner family. Iceberg 1.12 is the first release with a Flink 2.2 runtime. The compatibility evidence above is specific to this local pinned stack; it does not claim production-cluster validation.
 
-## 🗂️ Data model and semantics
+## 🗂️ Data model
 
-| Table | Layer | Purpose | Important behavior |
-|---|---|---|---|
-| `raw.order_cdc_events` | Speed / Batch | Append-only event log | The Beam speed job appends accepted deliveries with `pcl-speed-*` and checkpoints offsets. It may contain duplicate deliveries after a restart; nothing updates or deletes it. Spark deduplicates by `event_id` when projecting, and Trino reads it for audit. |
-| `serving.orders_current` | Serving | Low-latency current state | Flink UPSERTs one row per `order_id` through the `upsert-enabled` sink option and the table's identifier field. Spark overwrites a row when canonical `silver` is at the same or a newer position. Trino reads it. |
-| `silver.orders_current` | Batch | Authoritative current state | One row per order; latest source position wins; deletes remain as `is_deleted=true` tombstones; `last_operation` and `last_source_timestamp` describe the winning event. |
-| `ops.cdc_dead_letter` | Speed | Invalid input inspection | Stores the reason code and payload for invalid Debezium envelopes. |
-| `ops.materialization_state` | Batch | Incremental watermark | One row per target table; `last_ingested_at` is the arrival bound already folded into `silver`. |
-| `silver.orders_current_replay_<id>` | Batch | Isolated replay result | A run-scoped target created by `rake lakehouse:replay`; the canonical projection is left untouched. |
+| Table | Purpose |
+|---|---|
+| `raw.order_cdc_events` | Append-only log of accepted deliveries, with before/after images and source positions |
+| `silver.orders_current` | Authoritative current state: one row per order, deletes as tombstones |
+| `serving.orders_current` | Low-latency current state, upserted by `order_id` |
 
-Ordering uses LSN, then the numeric transaction id, then the intra-transaction `sequence` ordinal, then the deterministic event id. Event time and arrival time are not used as the sole precedence rule. Snapshot rows are marked distinctly; deterministic event IDs include the primary key because PostgreSQL snapshot rows can share a source position.
+`ops.cdc_dead_letter` holds invalid envelopes with their reason code, `ops.materialization_state` holds the batch watermark, and `silver.orders_current_replay_<id>` is a run-scoped replay target. Ordering is `(lsn, tx_id, seq_no, event_id)`; `raw` keeps every delivery and the projection deduplicates by `event_id`. Retention and compaction are out of scope.
 
-The log is at-least-once: the same `event_id` can appear more than once if the Flink speed job replays a checkpoint. That is expected and harmless. `projection_source.sql` keeps the newest delivery per `event_id` before ranking, so `silver` is one row per order. The serving writer trusts delivery order and does not rank; the batch correction is what guarantees that `serving` eventually matches `silver`.
-
-`lakehouse:materialize` runs the incremental projection and the serving correction. It uses `ingested_at` (arrival) to find the keys that changed since the last successful run and re-ranks the full history of only those keys. Source order still decides the winner, so a late event cannot overwrite a newer state. The watermark advances after the `MERGE` commits; a failed run is reprocessed, and the `MERGE` is idempotent. A replay is a full rebuild by definition and never touches the watermark or `serving`.
-
-There is no compaction step. Removing rows from `raw` would create a non-append snapshot and stop the Flink streaming reader; retention is deliberately out of scope for this POC.
-
-### 🚧 Scope and non-goals
+## 🚧 Scope and non-goals
 
 The POC implements the convergence machinery, not a business model. `silver` has no business rules: no status lifecycle, no SCD2, no aggregates, no masking. Reprocessing the log after a change in the **projection logic** is demonstrated; reprocessing after a change in **business rules** uses the same mechanism but is not exercised. That is a deliberate boundary, not a hidden gap: the log, the deterministic projection and the replay path are the parts that are expensive to retrofit, and they are the parts this POC validates.
 
