@@ -43,9 +43,7 @@ class DomainPuritySpec extends AnyFlatSpec with Matchers {
 
   it should "never reference Beam, Kafka, Iceberg or logging frameworks" in {
     val violations = domainClassFiles.flatMap { file =>
-      // A cheap structural proxy: read raw bytes and look for internal class names.
-      // Class files embed referenced types as UTF8 constants, so a prefix match is
-      // a reliable, dependency-free way to detect leakage without a bytecode library.
+      // Class files embed type names as UTF8 constants, so a prefix scan is enough.
       val bytes = java.nio.file.Files.readAllBytes(file.toPath)
       val raw   = new String(bytes, java.nio.charset.StandardCharsets.ISO_8859_1)
       val hits  = forbiddenPrefixes.filter(raw.contains)

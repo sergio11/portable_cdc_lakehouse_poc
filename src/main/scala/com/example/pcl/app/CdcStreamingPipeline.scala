@@ -137,14 +137,11 @@ object CdcStreamingPipeline {
           .withMaxNumRecords(settings.maxRecords)
           .withMaxReadTime(org.joda.time.Duration.standardSeconds(60))
       else kafkaRead
-    // The speed layer runs unbounded on Flink and owns its offsets: KafkaIO commits the
-    // checkpointed positions to the speed consumer group after the Iceberg append. The bounded
-    // manual run uses a separate consumer group and leaves offsets uncommitted.
+    // The speed job commits checkpointed offsets; the bounded run does not.
     val positionedRead =
       if (settings.commitOffsets) limitedRead.commitOffsetsInFinalize() else limitedRead
 
-    // Keep Kafka metadata: it becomes the raw reference (topic:partition:offset), which is the
-    // only stable pointer back to the original record when replaying or investigating a row.
+    // Kafka metadata becomes the raw reference (topic:partition:offset).
     val messages = pipeline.apply("Read Debezium topic", positionedRead)
 
     val routed: PCollectionTuple = messages.apply(
@@ -198,9 +195,7 @@ object CdcStreamingPipeline {
     catalogProperties.put("type", "rest")
     catalogProperties.put("uri", settings.icebergCatalogUri)
     catalogProperties.put("warehouse", settings.icebergWarehouse)
-    // Polaris authenticates every catalog call with OAuth2 client credentials.
-    // The token endpoint lives under the catalog base URI, and the scope is the
-    // Polaris principal role that owns the catalog.
+    // OAuth2 client credentials; token endpoint under the catalog URI.
     catalogProperties.put("rest.auth.type", "oauth2")
     catalogProperties.put(
       "credential",
@@ -238,8 +233,7 @@ object CdcStreamingPipeline {
       val payload      = record.getKV.getValue
       val rawReference = s"${record.getTopic}:${record.getPartition}:${record.getOffset}"
 
-      // Debezium emits a Kafka tombstone after a delete envelope. It has no CDC meaning and is
-      // skipped; the delete envelope itself was already routed through NormalizeCdc.
+      // Ignore Debezium key-only tombstones: the delete envelope was already handled.
       if (payload != null)
         NormalizeCdc.normalize(payload, sourceId, primaryKeyColumns, Some(rawReference)) match {
           case Right(event) =>

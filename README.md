@@ -398,12 +398,12 @@ The batch layer then caught up through its own path. `rake lakehouse:materialize
 
 ```text
 raw_deliveries     17
-raw_events         [PLACEHOLDER: verify final count]
-raw_duplicate_deliveries [PLACEHOLDER: verify final count]
+raw_events         17
+raw_duplicate_deliveries 0
 changed_keys       2
 projected_keys     2
-serving_rows       [PLACEHOLDER: verify final count]
-serving_live       [PLACEHOLDER: verify final count]
+serving_rows       7
+serving_live       6
 ```
 
 After the correction, `serving` and `silver` agree at LSN 48671968. The log keeps the event; it was never compacted or rewritten.
@@ -441,24 +441,24 @@ ops | materialization_state
 raw | order_cdc_events
 serving | orders_current
 silver | orders_current
-silver | orders_current_replay_readme_proof
 
 == current-state snapshots
-8420377990516329023 | overwrite | 2026-10-28 21:01:20.125 UTC
-6237484225022081417 | overwrite | 2026-10-28 20:53:59.581 UTC
-...
+7131151487439035446 | overwrite | 2026-11-03 19:14:32.296 UTC
+4896094255512414457 | overwrite | 2026-11-03 18:27:46.634 UTC
+2841251897447469863 | overwrite | 2026-11-02 15:01:59.715 UTC
+2364954906478816631 | append | 2026-11-02 14:25:24.939 UTC
 
 == materialization watermark
-silver.orders_current | 2026-10-28 20:50:45.807 UTC | 2026-10-28 21:01:20.942 UTC
+silver.orders_current | 2026-11-03 18:53:53.461 UTC | 2026-11-03 19:14:33.152 UTC
 
 == raw invariants
 raw_deliveries | 17
-raw_events | [PLACEHOLDER: verify final count]
-raw_duplicate_deliveries [PLACEHOLDER: verify final count]
+raw_events | 17
+raw_duplicate_deliveries | 0
 
 == lambda layers
-silver_keys | [PLACEHOLDER: verify final count]
-serving_keys | [PLACEHOLDER: verify final count]
+silver_keys | 7
+serving_keys | 7
 serving_behind_silver | 0
 ```
 
@@ -472,19 +472,19 @@ Reconciliation reports the log's delivery shape, checks that the projection agre
 
 ```text
 -- 2. Event log shape.
-17 | [PLACEHOLDER: verify] | [PLACEHOLDER: verify]
+17 | 17 | 0
 
 -- 5. Discrepancy report.
-1001 | [PLACEHOLDER: verify] | [PLACEHOLDER: verify] | UPDATE | UPDATE | false | false | ok
-1002 | [PLACEHOLDER: verify] | [PLACEHOLDER: verify] | UPDATE | UPDATE | false | false | ok
-1003 | [PLACEHOLDER: verify] | [PLACEHOLDER: verify] | UPDATE | UPDATE | false | false | ok
-1004 | [PLACEHOLDER: verify] | [PLACEHOLDER: verify] | DELETE | DELETE | true | true | ok
-1005 | [PLACEHOLDER: verify] | [PLACEHOLDER: verify] | CREATE | CREATE | false | false | ok
+1001 | 36690320 | 36690320 | UPDATE | UPDATE | false | false | ok
+1002 | 44642104 | 44642104 | UPDATE | UPDATE | false | false | ok
+1003 | 36720520 | 36720520 | UPDATE | UPDATE | false | false | ok
+1004 | 36690992 | 36690992 | DELETE | DELETE | true | true | ok
+1005 | 45378176 | 45378176 | UPDATE | UPDATE | false | false | ok
 1006 | 48671968 | 48671968 | UPDATE | UPDATE | false | false | ok
-1007 | [PLACEHOLDER: verify] | [PLACEHOLDER: verify] | UPDATE | UPDATE | false | false | ok
+1007 | 36692136 | 36692136 | UPDATE | UPDATE | false | false | ok
 
 -- 8. Serving layer shape.
-[PLACEHOLDER: verify] | [PLACEHOLDER: verify] | 0 | 0
+7 | 6 | 0 | 0
 
 -- 9. Serving discrepancy report.
 (no rows)
@@ -502,12 +502,12 @@ A bounded replay applies the same logic to an inclusive LSN window, so the targe
 
 ```text
 $ $env:PCL_REPLAY_ID='window_probe'
-$ $env:PCL_REPLAY_FROM_LSN='31464100'; $env:PCL_REPLAY_TO_LSN='31465000'
+$ $env:PCL_REPLAY_FROM_LSN='45378176'; $env:PCL_REPLAY_TO_LSN='48671968'
 $ rake lakehouse:replay
-Replay window_probe materialized to pcl.silver.orders_current_replay_window_probe: 5 keys, 1 tombstones.
+Replay window_probe materialized to pcl.silver.orders_current_replay_window_probe: 2 keys, 0 tombstones.
 ```
 
-Orders 1006 and 1007 are absent because their events fall outside the window. A bounded replay is a partial history by construction, so `lakehouse:replay` reports its shape instead of asserting equality with the live projection.
+Orders 1005 and 1006 fall inside the window; 1001–1004 and 1007 are absent because their events fall outside it. A bounded replay is a partial history by construction, so `lakehouse:replay` reports its shape instead of asserting equality with the live projection.
 
 ### 6. Invalid envelopes are quarantined, not dropped
 
@@ -549,23 +549,19 @@ Schedule: pcl_incremental_every_five_minutes [RUNNING]
 Cron Schedule: */5 * * * *
 ```
 
-A tick that finds new log rows projects the changed keys and corrects serving:
-
-```text
-... orders_current - changed_keys 2, projected_keys 2.
-... orders_current_projection_matches_history - Asset check 'projection_matches_history' on 'orders_current' passed. Description: '0 keys disagree with the history.'
-... serving_orders - keys_needing_correction 2, serving_rows [PLACEHOLDER: verify final count].
-... serving_orders_serving_matches_silver - Asset check 'serving_matches_silver' on 'serving_orders' passed. Description: '0 silver keys are missing or stale in serving.'
-... RUN_SUCCESS - Finished execution of run for "pcl_incremental".
-```
-
-On an idle tick the log has no new arrival, `silver` has no pending keys, and serving already matches, so Dagster skips both Spark containers and still runs the checks:
+The validated run found no new arrivals, so it skipped both Spark containers and still ran the checks:
 
 ```text
 ... orders_current - No new events since the watermark; skipping the MERGE.
+... orders_current_projection_matches_history - Asset check 'projection_matches_history' on 'orders_current' passed.
+    Description: '0 keys disagree with the history.'
 ... serving_orders - Serving already matches silver; skipping the correction MERGE.
+... serving_orders_serving_matches_silver - Asset check 'serving_matches_silver' on 'serving_orders' passed.
+    Description: '0 silver keys are missing or stale in serving.'
 ... RUN_SUCCESS - Finished execution of run for "pcl_incremental".
 ```
+
+When there is pending work, the same steps run the Spark projection and the serving MERGE; section 3 shows the real output of that path (`changed_keys 2`, `projected_keys 2`, `serving_rows 7`).
 
 Both checks passed in the validated run (`projection_matches_history`, `serving_matches_silver`).
 
@@ -573,11 +569,13 @@ The metadata the run recorded:
 
 | Asset | Metadata | Value |
 |---|---|---|
-| `orders_current` | pending log events | 2 |
-| `orders_current` | changed / projected keys | 2 / 2 |
-| `orders_current` | watermark | `2026-10-28 20:50:45.807345 UTC` |
+| `orders_current` | pending log events | 0 |
+| `orders_current` | changed / projected keys | 0 / 0 |
+| `orders_current` | watermark | `2026-11-03 18:08:33.167 UTC` |
 | `orders_current` | projection keys (live / tombstone) | 7 (6 / 1) |
-| `serving_orders` | keys needing correction / serving keys | 2 / 7 |
+| `serving_orders` | keys needing correction / serving keys | 0 / 7 |
+
+The last manual batch run advanced the watermark to `2026-11-03 19:14:33.152 UTC`, as shown in section 4.
 
 The run queue serializes ticks (`max_concurrent_runs: 1` in `infra/dagster/dagster.yaml`): a tick that fires while a projection is still running waits for it instead of writing the same Iceberg files concurrently.
 

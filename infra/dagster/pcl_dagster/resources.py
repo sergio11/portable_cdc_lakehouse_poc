@@ -96,8 +96,7 @@ class Trino(ConfigurableResource):
                 raise RuntimeError(f"Trino HTTP {response.status_code}: {response.text[:400]}")
 
             payload = response.json()
-            # A failed query still answers 200 with an error payload, so the
-            # status code alone would report a clean bill of health on bad SQL.
+            # Errors arrive as HTTP 200 with an `error` payload.
             if payload.get("error"):
                 error = payload["error"]
                 raise RuntimeError(

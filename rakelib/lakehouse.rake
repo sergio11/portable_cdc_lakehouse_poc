@@ -1,12 +1,8 @@
 # frozen_string_literal: true
 
-# Lakehouse operations: create the Iceberg schemas/tables, register the Debezium
-# connector, and expose inspection queries. All of it goes through the same
-# running services that the pipeline uses, so there is no parallel tooling path.
+# Lakehouse operations through the running services.
 
-# Registers the Debezium PostgreSQL connector against the running Connect REST
-# API. The connector definition is a committed template; the password placeholder
-# is substituted from .env at call time so no credential is ever in Git.
+# Registers the Debezium connector; the password placeholder comes from .env.
 module Debezium
   TEMPLATE = File.join("infra", "debezium", "postgres-orders-connector.json").freeze
 
@@ -227,9 +223,7 @@ namespace :query do
     Trino.assert_read_only!(statements)
     query_id = nil
 
-    # One block per statement, labelled with its leading comment. Printing the
-    # whole file once and then a flat result stream made multi-section reports
-    # such as reconciliation.sql impossible to read.
+    # One labelled block per statement.
     statements.each do |statement|
       result = Trino.execute(statement, env)
       query_id = result["query_id"]

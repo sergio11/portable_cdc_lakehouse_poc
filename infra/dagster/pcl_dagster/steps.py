@@ -18,8 +18,7 @@ from .resources import Podman
 SPARK_CONF = ".local/spark/spark-defaults.conf"
 SPARK_WORK_DIR = ".local/spark/work"
 
-# Placeholders in spark-defaults.conf.template and the fallback Rake uses when
-# .env does not set them.
+# Spark conf placeholders and their fallback defaults.
 SPARK_CONF_KEYS = {
     "PCL_ICEBERG_WAREHOUSE": "pcl",
     "PCL_POLARIS_CLIENT_ID": "root",

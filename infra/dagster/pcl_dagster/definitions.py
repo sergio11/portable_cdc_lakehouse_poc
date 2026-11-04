@@ -60,16 +60,13 @@ defs = Definitions(
             job=incremental_job,
             cron_schedule="*/5 * * * *",
             execution_timezone="UTC",
-            # The stack is meant to run unattended: a stopped schedule would look
-            # healthy in the UI and never fire.
+            # Unattended stack: a stopped schedule would silently never fire.
             default_status=DefaultScheduleStatus.RUNNING,
         )
     ],
     resources={
         "podman": Podman(
-            # This is the path *inside* the Dagster container: Compose mounts the
-            # host socket there. PCL_PODMAN_SOCKET is the host-side path used by
-            # the bind mount, not something the container can connect to.
+            # Container-side socket path (the host path is PCL_PODMAN_SOCKET).
             socket=env("PCL_DAGSTER_PODMAN_SOCKET", "/run/podman/podman.sock"),
             host_workspace=env("PCL_HOST_WORKSPACE", ""),
             network=env("PCL_DOCKER_NETWORK", "pcl_default"),

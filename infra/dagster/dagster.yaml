@@ -1,6 +1,4 @@
-# Run and event history live in the same PostgreSQL instance as the rest of the
-# stack, in their own database, so the orchestrator survives container restarts
-# without a local SQLite file. Credentials come from the container environment.
+# Postgres-backed run and event history.
 storage:
   postgres:
     postgres_db:
@@ -15,9 +13,7 @@ storage:
 telemetry:
   enabled: false
 
-# Serialize runs: two overlapping projections would both rewrite the same
-# Iceberg files and make one abort with a conflicting-files validation error. A
-# tick that fires while a run is active waits in the queue.
+# One run at a time: overlapping projections would conflict on Iceberg files.
 run_coordinator:
   module: dagster._core.run_coordinator
   class: QueuedRunCoordinator

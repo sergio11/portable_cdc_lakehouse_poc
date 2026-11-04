@@ -1,7 +1,5 @@
--- Shared ranking, spliced into materialize and replay by Rake.
--- Input: pcl_raw_scope. Output: pcl_projection_source (one row per order).
--- raw is an at-least-once log, so the same event_id can appear more than once;
--- the dedup below keeps the newest delivery. LSN order decides the winner.
+-- Shared ranking for materialize and replay: newest delivery per event_id,
+-- then LSN order decides the winning row per key.
 
 CREATE OR REPLACE TEMPORARY VIEW pcl_projection_source AS
 WITH deduped AS (
