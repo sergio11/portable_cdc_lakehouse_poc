@@ -36,7 +36,11 @@ This repository is an open-source engineering experiment intended for learning a
 
 ## 🎯 Project goal
 
-The goal is to make the path from a relational database change to an auditable lakehouse table visible and reproducible. The POC focuses on the boundaries that are easy to get wrong in streaming systems: CDC envelope normalization, source-position ordering, duplicate delivery, delete tombstones, replay, the split between a low-latency serving projection and an authoritative current state, and the interaction between Flink, Spark, Iceberg, and a REST catalog.
+The goal is to make the path from a relational database change to an auditable lakehouse table visible and runnable. The POC focuses on the boundaries that are easy to get wrong in streaming systems: CDC envelope normalization, source-position ordering, duplicate delivery, delete tombstones, replay, the split between a low-latency serving projection and an authoritative current state, and the interaction between Flink, Spark, Iceberg, and a REST catalog.
+
+> **The hard part is not the business logic. It is making two writers converge after at-least-once delivery, without a query-time merge.**
+
+The POC proves that machinery and leaves business rules as an explicit extension point: `silver` is where they belong, and the log already supports reprocessing them.
 
 ## ⚖️ Why this architecture
 
@@ -47,12 +51,20 @@ PostgreSQL answers *what is the state now*. This POC also answers *how did it ge
 | What is the current state? | Yes, simple and fast | Yes, in `serving` within seconds, and in `silver` authoritatively |
 | What changed, and when? | No, only the live row | Yes, in the append-only `raw` log with before/after images |
 | What happened to deleted rows? | No, they are gone | Yes, versioned tombstones |
-| Can I reprocess after a rule or bug fix? | No, the changes are lost | Yes, rebuild `silver` from `raw` |
+| Can I reprocess after a projection-logic fix? | No, the changes are lost | Yes, rebuild `silver` from `raw` |
+| Can I add business rules later? | No, each consumer reimplements them | Yes, `silver` is the extension point; correctness is already solved |
+| Can I serve fresh reads without querying the OLTP? | No, every reader loads the primary | Yes, `serving` is written from the log |
 | Can analytics run without loading the operational database? | No, they compete with the application | Yes, Trino and Iceberg |
 | Can several consumers read the same stream? | No, they couple to the database | Yes, one Kafka stream, two independent readers |
 | Can I read the table as of a past snapshot? | No | Yes, Iceberg snapshots |
 
-The trade-off is explicit: two continuous Flink writers, a five-minute Spark projection, an unbounded event log, and more moving parts (Kafka, Flink, Spark, Iceberg, Polaris, Trino). The speed layer gives seconds of freshness; the batch layer gives a rebuildable, authoritative current state. For a small dataset that only needs the current row, a direct `SELECT` is the better engineering choice.
+The trade-off is explicit: two continuous Flink writers, a five-minute Spark projection, an unbounded event log, and more moving parts (Kafka, Flink, Spark, Iceberg, Polaris, Trino). The speed layer gives seconds of freshness; the batch layer gives a rebuildable, authoritative current state.
+
+A direct `SELECT` is still the better answer when the only requirement is the current row of a small dataset and every reader can reach the operational database. The usual alternatives each solve a narrower problem: a read replica removes the load from the primary but keeps the schema, the engine and the availability coupling; a foreign data wrapper pushes the same analytical queries back to it; point-in-time recovery restores a whole cluster to a moment, not a queryable per-row history; and an audit feature inside the OLTP — Oracle Flashback Data Archive is the canonical example — keeps row history, but inside the transactional engine, under its license and its compute, and without the ability to re-run a projection or expose an open table format.
+
+The POC earns its moving parts when at least two of these are true: a reader needs current state in seconds and cannot query the OLTP; the history must be queried or replayed, not merely retained; several engines or teams consume the same data; the data must survive a migration away from the source engine; or analytics must not compete with production.
+
+**PostgreSQL answers what is true now. This POC answers what happened, in which order, and whether that answer can be rebuilt.**
 
 ## ✨ Key highlights
 
@@ -66,6 +78,8 @@ The trade-off is explicit: two continuous Flink writers, a five-minute Spark pro
 - 🩹 **Correct serving from silver** whenever the batch position is newer or equal.
 - 🔁 Replay the log into an isolated Iceberg table.
 - 🔒 Give Trino read-only access: no views, no writes, no query-time merge.
+- 🧭 Converge two writers under at-least-once delivery without a query-time merge.
+- 🧱 Keep `silver` as the deterministic reference and the place where business rules belong.
 - 📦 Run local dependencies with Podman; operate the POC through Rake.
 
 ## 🏗️ Architecture
@@ -117,6 +131,7 @@ Polaris serves the Iceberg catalog and MinIO stores the data files, so every eng
 | **Raw log** | `raw.order_cdc_events`: the immutable, append-only history of deliveries. |
 | **Source position** | `(lsn, tx_id, seq_no)`. LSN alone is not a total order: a transaction can change several rows, and snapshot rows can share a position. |
 | **Correction** | Overwriting a serving row when the canonical `silver` position is newer or equal. |
+| **Convergence** | Making `serving` return to the canonical `silver` position after duplicates, reordering or a delayed batch run. |
 | **Watermark** | The newest arrival time already folded into `silver.orders_current`. |
 
 ### 🧱 The layers
@@ -159,6 +174,29 @@ The last clause is the tie-breaker that lets batch win an exact-event tie. The c
 - A row the speed writer projected **incorrectly** is replaced by the canonical version as soon as batch reaches the same position or later.
 - Re-running the correction at the same position changes nothing; the MERGE is idempotent.
 
+### ⚡ Why a serving layer at all?
+
+A serving table is only justified when a reader needs current state in seconds **and** cannot query PostgreSQL. Checkout, a support agent and a fraud decision are transactional readers: they should query the operational database, which is the source, is indexed, and is fresher than any copy.
+
+The lakehouse serving table exists for the readers outside that boundary: analytics and BI tools without production credentials, live operational dashboards that aggregate instead of looking up a key, joins that combine current state with history or with other Iceberg tables, and data products whose contract is the lakehouse rather than the OLTP. A read replica is the closest alternative and often the right one for a single source, a single engine and an accepted lag; it stops being enough when several sources, an open format or horizontal read scale are required.
+
+The property that makes the layer safe is that a serving row is not "unconsolidated data". It is the best known state at a **known source position**, and the correction merge guarantees it never stays behind the authority. In the live run, `serving` was ahead of `silver` for a few minutes (`PAID @ 48671968` versus `NEW @ 36691664`); the batch run then converged both at the newer position. *Consolidated* means "processed by the batch", not "more correct".
+
+The layer is also removable: point Trino at `silver`, stop the SQL job, and the log, the batch projection and the reconciliation keep working. Removing it costs freshness, not correctness.
+
+### 🧾 Why a batch layer: silver is the reference
+
+`serving` is fast because it trusts delivery order. `silver` is authoritative because it ignores it: it deduplicates by `event_id` and re-ranks the full history of each key by `(lsn, tx_id, seq_no, event_id)`. The two can disagree for minutes without either being wrong; the correction merge makes the fast one converge to the slow one.
+
+That makes `silver` more than a copy:
+
+- it is the **reference implementation** of current state — the answer as a function of source order, not of what the pipeline saw first;
+- it is the **repair target** when serving is stale or wrong;
+- it owns the **watermark** that makes the projection incremental;
+- it is a **second, independent derivation** from the same log, which is what lets reconciliation detect a bug in either path. A single writer cannot audit itself.
+
+`silver` does not implement business rules today. Its projection is mechanical: normalize, deduplicate, rank, tombstone. Business rules — status lifecycles, SCD2, aggregates, masking — belong in this layer, and the log already supports reprocessing them. What the POC proves is the part that is hard to retrofit: **correctness under duplicate delivery and out-of-order history**.
+
 ### ✍️ Who writes what
 
 | Writer | Writes | Never writes |
@@ -168,6 +206,14 @@ The last clause is the tie-breaker that lets batch win an exact-event tie. The c
 | Spark | `silver`, serving correction, replay tables, DDL | `raw` |
 | Dagster | Orchestration and metadata | Data files |
 | Trino | Nothing | Any table, view, schema, or catalog object |
+
+### 🔁 Duplicates are a property, not a bug
+
+The log is at-least-once by contract. A path through Kafka, Flink, Iceberg and Spark has no end-to-end exactly-once without distributed transactions across all of them. Duplicates appear when Flink restarts between checkpoints and replays the records processed since the last one, when Debezium re-executes a snapshot or the connector restarts, when a consumer group rebalances or its offsets are reset, and when the bounded DirectRunner portability run re-reads the topic.
+
+The log records what arrived, duplicates included, because it is **evidence**, not interpretation. Deduplicating at write time would require state and a business decision, and updating or deleting rows in `raw` would produce a non-append snapshot that stops the Iceberg streaming reader. The judgment belongs downstream: `projection_source.sql` keeps the newest delivery per `event_id`, and the `order_id` upsert plus the position-aware merge absorb the rest.
+
+The validated window had 17 deliveries for 17 distinct events and no duplicate deliveries. That is a sample, not a guarantee: the system is designed for the duplicate that has not arrived yet.
 
 ### 🛡️ Why the layers are independent
 
@@ -239,7 +285,7 @@ Iceberg stores the append-only event log, the batch projection and the serving t
 
 ### 🗄️ MinIO — local S3-compatible object storage
 
-MinIO gives Beam, Flink, Spark and Trino a shared S3 API endpoint without requiring a cloud account. Iceberg data files live in its persistent Podman volume. The POC builds a pinned upstream MinIO release locally, so the binary and the image are reproducible.
+MinIO gives Beam, Flink, Spark and Trino a shared S3 API endpoint without requiring a cloud account. Iceberg data files live in its persistent Podman volume. The POC builds a pinned upstream MinIO release locally, so the binary and the image come from the same pinned source.
 
 ### 📚 Apache Polaris — shared Iceberg REST catalog
 
@@ -253,7 +299,7 @@ Trino reads the materialized Iceberg tables through Polaris and answers business
 
 Dagster is the entrypoint of the **batch layer only**: every five minutes it runs the same pinned Spark container the Rake tasks run, so there is no second implementation. Each run projects the log into `silver` incrementally and corrects `serving`, skipping the JVMs when there is nothing to do. Two asset checks gate each run, and run history lives in a `dagster` database in the same PostgreSQL instance. The speed and serving writers are **not** scheduled here: `rake pipeline:speed:up` starts them as Compose services. Replay stays explicit: `rake dagster:replay[id,from_lsn,to_lsn]`.
 
-### 📦 Podman, Compose, and Rake — reproducible local operations
+### 📦 Podman, Compose, and Rake — pinned local operations
 
 Podman runs the services and job containers without requiring Docker Engine. Compose describes the pinned services, named data volumes, the optional Flink cluster and the two speed writers. Rake provides repeatable commands for startup/readiness, builds, speed-layer lifecycle, replay, queries, and shutdown. Dagster owns the unattended batch path; Rake owns the speed layer and the manual/test path.
 
@@ -298,6 +344,10 @@ The log is at-least-once: the same `event_id` can appear more than once if the F
 `lakehouse:materialize` runs the incremental projection and the serving correction. It uses `ingested_at` (arrival) to find the keys that changed since the last successful run and re-ranks the full history of only those keys. Source order still decides the winner, so a late event cannot overwrite a newer state. The watermark advances after the `MERGE` commits; a failed run is reprocessed, and the `MERGE` is idempotent. A replay is a full rebuild by definition and never touches the watermark or `serving`.
 
 There is no compaction step. Removing rows from `raw` would create a non-append snapshot and stop the Flink streaming reader; retention is deliberately out of scope for this POC.
+
+### 🚧 Scope and non-goals
+
+The POC implements the convergence machinery, not a business model. `silver` has no business rules: no status lifecycle, no SCD2, no aggregates, no masking. Reprocessing the log after a change in the **projection logic** is demonstrated; reprocessing after a change in **business rules** uses the same mechanism but is not exercised. That is a deliberate boundary, not a hidden gap: the log, the deterministic projection and the replay path are the parts that are expensive to retrofit, and they are the parts this POC validates.
 
 ## 🚀 Quick start
 
@@ -511,7 +561,7 @@ Orders 1005 and 1006 fall inside the window; 1001–1004 and 1007 are absent bec
 
 ### 6. Invalid envelopes are quarantined, not dropped
 
-Four deliberately invalid envelopes were published to the same Kafka topic: truncated JSON, an unknown `op`, a delete with no row image, and an update with no primary key. `infra/fixtures/invalid_envelopes.jsonl` holds them, so the check is reproducible:
+Four deliberately invalid envelopes were published to the same Kafka topic: truncated JSON, an unknown `op`, a delete with no row image, and an update with no primary key. `infra/fixtures/invalid_envelopes.jsonl` holds them, so the check is repeatable:
 
 ```powershell
 Get-Content infra/fixtures/invalid_envelopes.jsonl |
@@ -601,6 +651,8 @@ A single capture of the commands behind the state above:
 - **Append-only ingest.** Flink appends the log and never rewrites it; Spark deduplicates by `event_id` when projecting, so a redelivery cannot change the current state.
 - **Low latency without a query-time merge.** Flink UPSERTs the serving table, so Trino reads a materialized row instead of unioning layers.
 - **Batch remains authoritative.** The correction MERGE is position-aware: it never regresses a newer speed row and always replaces a stale one.
+- **A reference, not a copy.** `silver` re-ranks the full history by source position, so it can arbitrate `serving` and expose a bug in either derivation.
+- **Convergence, not just retries.** At-least-once is absorbed by `event_id` dedup, the `order_id` upsert and the position-aware merge; the system returns to a correct state instead of merely retrying.
 - **Auditable by construction.** The log keeps every delivery with before/after images, deletes stay as tombstones, and reconciliation plus a full replay must agree with the live projection.
 - **Read-only serving.** Trino has no write, view, or ownership privilege; Spark and Flink are the only writers.
 
