@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🧊 Portable CDC Lakehouse: A Reproducible Lambda Architecture for PostgreSQL CDC
+# 🧊 Portable CDC Lakehouse: An End-to-End Lambda Architecture for PostgreSQL CDC
 
 [![Java 21](https://img.shields.io/badge/Java-21-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://adoptium.net/)
 [![Apache Beam 2.76](https://img.shields.io/badge/Apache_Beam-2.76-F0772B?style=for-the-badge&logo=apachebeam&logoColor=white)](https://beam.apache.org/)
