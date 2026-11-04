@@ -134,17 +134,6 @@ Polaris serves the Iceberg catalog and MinIO stores the data files, so every eng
 | **Convergence** | Making `serving` return to the canonical `silver` position after duplicates, reordering or a delayed batch run. |
 | **Watermark** | The newest arrival time already folded into `silver.orders_current`. |
 
-### 🧱 The layers
-
-| Layer | Reads | Writes | Owns | If it stops |
-|---|---|---|---|---|
-| **Speed writer** | Kafka, group `pcl-speed-<source>` | `raw.order_cdc_events` (append), dead letters | Flink checkpoints and the speed group offsets | Serving stops advancing; batch still projects from the log. |
-| **Serving writer** | `raw.order_cdc_events` in streaming | `serving.orders_current` (UPSERT) | The low-latency projection | Serving stops advancing; batch still corrects it. |
-| **Batch** | `raw.order_cdc_events` | `silver`, serving correction, replay tables | The authoritative projection and the watermark | Serving keeps the last batch plus whatever Flink still wrote. |
-| **Read** | `raw`, `silver`, `serving` | Nothing | Nothing | Queries fail; no stored data changes. |
-
-The two Flink jobs are continuous and independent of Dagster. The batch graph is incremental: it projects only the keys touched since the watermark and corrects only the serving keys that disagree with `silver`.
-
 **Why the log is append-only.** Iceberg's Flink streaming reader follows *append* snapshots. If the batch layer updated or deleted rows in `raw`, the reader would hit a non-append snapshot and fail. Keeping `raw` immutable removes that conflict by construction, and it is also the honest shape of a lambda log: the speed writer appends, the batch layer reads.
 
 ### 🔁 What happens to one event
@@ -157,9 +146,9 @@ The two Flink jobs are continuous and independent of Dagster. The batch graph is
 6. **Correct serving.** Spark compares `serving` with `silver` and overwrites a serving row only when the batch position is newer or equal. A speed event that already advanced a key is never rolled back by a delayed batch run.
 7. **Read.** Trino evaluates a plain `SELECT` over the materialized tables. It does not merge layers, define views, or write anything.
 
-### 🩹 How serving is corrected
+### 🩹 Serving: fast, never behind
 
-The correction MERGE uses the strongest available order:
+A serving row is not "unconsolidated data": it is the best known state at a **known source position**, and the correction merge guarantees it never stays behind `silver`. The merge compares positions, not arrival times:
 
 ```text
 last_lsn > serving.last_lsn
@@ -168,21 +157,11 @@ OR (last_lsn = serving.last_lsn AND batch.tx_id = serving.tx_id AND batch.seq_no
 OR (equal position AND batch.last_event_id >= serving.last_event_id)
 ```
 
-The last clause is the tie-breaker that lets batch win an exact-event tie. The consequences are:
-
 - A speed row that is **newer** than batch stays visible and is never regressed by a delayed batch run.
-- A row the speed writer projected **incorrectly** is replaced by the canonical version as soon as batch reaches the same position or later.
+- A row projected **incorrectly** is replaced by the canonical version as soon as batch reaches the same position or later.
 - Re-running the correction at the same position changes nothing; the MERGE is idempotent.
 
-### ⚡ Why a serving layer at all?
-
-A serving table is only justified when a reader needs current state in seconds **and** cannot query PostgreSQL. Checkout, a support agent and a fraud decision are transactional readers: they should query the operational database, which is the source, is indexed, and is fresher than any copy.
-
-The lakehouse serving table exists for the readers outside that boundary: analytics and BI tools without production credentials, live operational dashboards that aggregate instead of looking up a key, joins that combine current state with history or with other Iceberg tables, and data products whose contract is the lakehouse rather than the OLTP. A read replica is the closest alternative and often the right one for a single source, a single engine and an accepted lag; it stops being enough when several sources, an open format or horizontal read scale are required.
-
-The property that makes the layer safe is that a serving row is not "unconsolidated data". It is the best known state at a **known source position**, and the correction merge guarantees it never stays behind the authority. In the live run, `serving` was ahead of `silver` for a few minutes (`PAID @ 48671968` versus `NEW @ 36691664`); the batch run then converged both at the newer position. *Consolidated* means "processed by the batch", not "more correct".
-
-The layer is also removable: point Trino at `silver`, stop the SQL job, and the log, the batch projection and the reconciliation keep working. Removing it costs freshness, not correctness.
+The layer is justified when a reader needs current state in seconds **and** cannot query PostgreSQL. Transactional readers — checkout, support, fraud — belong on the operational database. The lakehouse serving table is for analytics without production credentials, live aggregate dashboards, joins that combine current state with history or other Iceberg tables, and data products whose contract is the lakehouse. A read replica covers the single-source case; several sources, an open format or horizontal read scale do not. In the live run, `serving` was ahead of `silver` for a few minutes (`PAID @ 48671968` versus `NEW @ 36691664`); the batch run converged both. *Consolidated* means "processed by the batch", not "more correct". The layer is removable: point Trino at `silver` and stop the SQL job; you lose freshness, not correctness.
 
 ### 🧾 Why a batch layer: silver is the reference
 
@@ -197,61 +176,13 @@ That makes `silver` more than a copy:
 
 `silver` does not implement business rules today. Its projection is mechanical: normalize, deduplicate, rank, tombstone. Business rules — status lifecycles, SCD2, aggregates, masking — belong in this layer, and the log already supports reprocessing them. What the POC proves is the part that is hard to retrofit: **correctness under duplicate delivery and out-of-order history**.
 
-### ✍️ Who writes what
-
-| Writer | Writes | Never writes |
-|---|---|---|
-| Beam speed job | `raw.order_cdc_events` (append), `ops.cdc_dead_letter` | `silver`, `serving` |
-| Flink SQL serving job | `serving.orders_current` (UPSERT) | `raw`, `silver` |
-| Spark | `silver`, serving correction, replay tables, DDL | `raw` |
-| Dagster | Orchestration and metadata | Data files |
-| Trino | Nothing | Any table, view, schema, or catalog object |
-
 ### 🔁 Duplicates are a property, not a bug
 
-The log is at-least-once by contract. A path through Kafka, Flink, Iceberg and Spark has no end-to-end exactly-once without distributed transactions across all of them. Duplicates appear when Flink restarts between checkpoints and replays the records processed since the last one, when Debezium re-executes a snapshot or the connector restarts, when a consumer group rebalances or its offsets are reset, and when the bounded DirectRunner portability run re-reads the topic.
-
-The log records what arrived, duplicates included, because it is **evidence**, not interpretation. Deduplicating at write time would require state and a business decision, and updating or deleting rows in `raw` would produce a non-append snapshot that stops the Iceberg streaming reader. The judgment belongs downstream: `projection_source.sql` keeps the newest delivery per `event_id`, and the `order_id` upsert plus the position-aware merge absorb the rest.
-
-The validated window had 17 deliveries for 17 distinct events and no duplicate deliveries. That is a sample, not a guarantee: the system is designed for the duplicate that has not arrived yet.
-
-### 🛡️ Why the layers are independent
-
-- **One log, two readers.** The Beam job owns `pcl-speed-<source>` and its checkpoints; the serving job follows the log; Spark reconciles on a schedule. None of them shares a consumer group with another.
-- **At-least-once with idempotent effects.** A Flink restart can re-append a delivery. In the log, duplicates are expected; the projection deduplicates by `event_id`. In `serving`, the upsert key is `order_id` and the correction MERGE is position-aware.
-- **Append-only by construction.** No step rewrites or deletes the log, so the Flink streaming reader never encounters a non-append snapshot.
-- **Rebuildable.** Losing `raw` costs a Kafka replay, not history; there is no second copy to keep in sync.
-- **No query-time merge.** Trino reads committed Iceberg snapshots. There is no third copy to keep consistent and no engine-specific view dialect to maintain.
-- **Replay is isolated.** `lakehouse:replay` rebuilds a separate table from the log; it never touches `silver`, the watermark, or `serving`.
+The log is at-least-once by contract: no end-to-end exactly-once across Kafka, Flink, Iceberg and Spark without distributed transactions between all of them. Duplicates appear when Flink restarts between checkpoints and replays the records since the last one, when Debezium re-executes a snapshot, when a consumer group rebalances, or when the bounded DirectRunner run re-reads the topic. The log records what arrived because it is **evidence**, not interpretation: deduplicating at write time would require state and a business decision, and updating `raw` would stop the append-only reader. The judgment belongs downstream — the projection keeps the newest delivery per `event_id`, and the `order_id` upsert plus the position-aware merge absorb the rest. The validated window had 17 deliveries for 17 events and no duplicates; that is a sample, not a guarantee.
 
 ### ⏱️ Two clocks
 
-```mermaid
-sequenceDiagram
-    participant K as Kafka
-    participant S as Beam on Flink
-    participant F as Flink SQL
-    participant G as Dagster
-    participant X as Spark
-    participant T as Trino
-
-    loop continuous
-        K->>S: deliveries (pcl-speed-*)
-        S->>S: append raw.order_cdc_events
-        S->>K: commit checkpointed offsets
-        S->>F: new log rows
-        F->>F: UPSERT serving.orders_current
-    end
-
-    loop every 5 minutes
-        G->>X: project raw -> silver
-        X->>X: correct serving from silver
-    end
-
-    T->>T: SELECT raw / silver / serving
-```
-
-The speed loop is a real unbounded Flink job: the submitter hands the graph to the JobManager and TaskManager, which execute it continuously and checkpoint every 10 seconds. The serving writer is a second Flink job on the same cluster. The batch loop is the only writer of `silver` and the serving correction; it can lag, fail, or be replayed without stopping the speed path.
+The speed loop runs in seconds and the batch loop every five minutes. They share no consumer group, checkpoint or orchestration: if the speed writer stops, batch still projects from the log; if batch stops, serving keeps the last batch plus whatever Flink writes; if Trino stops, no stored data changes. The speed job checkpoints every 10 seconds, and the batch loop is the only writer of `silver` and the serving correction.
 
 ## 🧰 Technologies and why they were chosen
 
@@ -419,18 +350,6 @@ All services ready.
   Speed layer  rake pipeline:speed:up  (Flink, continuous)
 ```
 
-```text
-$ podman logs pcl-polaris-bootstrap
-Realm 'POLARIS' successfully bootstrapped.
-Bootstrap completed successfully.
-
-$ podman logs pcl-polaris-setup
-Requesting a Polaris access token...
-Polaris catalog 'pcl' already exists.
-Polaris catalog role 'catalog_admin' already holds CATALOG_MANAGE_CONTENT.
-Polaris catalog 'pcl' already enables drop-with-purge.
-```
-
 The realm is stored in PostgreSQL, and the health endpoint reports `UP`:
 
 ![Apache Polaris health endpoint](docs/screenshots/01-polaris-health.png)
@@ -481,23 +400,7 @@ After the correction, `serving` and `silver` agree at LSN 48671968. The log keep
 
 ### 4. Spark materializes through Polaris
 
-`rake lakehouse:init` creates the namespaces and tables with a one-shot `spark-sql` container. The bootstrap also sets `order_id` as the serving identifier field and enables merge-on-read upserts, which is what makes the Flink SQL sink an upsert instead of an append:
-
-```text
-$ rake lakehouse:init
-$ podman run --rm --network pcl_default ... localhost/pcl-spark:3.5.9-iceberg-1.11.0 \
-    /opt/spark/bin/spark-sql --properties-file /opt/pcl/conf/spark-defaults.conf -f /opt/pcl/conf/work/bootstrap_catalog.sql
-Spark master: local[*], Application Id: local-1793215973901
-Time taken: 10.077 seconds
-Time taken: 0.187 seconds
-Time taken: 0.235 seconds
-Time taken: 6.058 seconds
-Time taken: 1.804 seconds
-Time taken: 0.303 seconds
-Time taken: 0.205 seconds
-Time taken: 0.181 seconds
-Iceberg tables are ready (raw, silver, serving, ops).
-```
+`rake lakehouse:init` creates the namespaces and tables with a one-shot `spark-sql` container. The bootstrap also sets `order_id` as the serving identifier field and enables merge-on-read upserts, which is what makes the Flink SQL sink an upsert instead of an append.
 
 The first materialization reads the watermark (epoch) and scans every key; later runs rescan only the keys with new arrivals. Because the `MERGE` is idempotent, a repeated batch converges on the same result.
 
@@ -634,8 +537,6 @@ The validated run found no new arrivals, so it skipped both Spark containers and
 
 When there is pending work, the same steps run the Spark projection and the serving MERGE; section 3 shows the real output of that path (`changed_keys 2`, `projected_keys 2`, `serving_rows 7`).
 
-Both checks passed in the validated run (`projection_matches_history`, `serving_matches_silver`).
-
 The metadata the run recorded:
 
 | Asset | Metadata | Value |
@@ -646,7 +547,7 @@ The metadata the run recorded:
 | `orders_current` | projection keys (live / tombstone) | 7 (6 / 1) |
 | `serving_orders` | keys needing correction / serving keys | 0 / 7 |
 
-The last manual batch run advanced the watermark to `2026-11-03 19:14:33.152 UTC`, as shown in section 4.
+The last manual batch run advanced the watermark to `2026-11-03 19:14:33.152 UTC`.
 
 The run queue serializes ticks (`max_concurrent_runs: 1` in `infra/dagster/dagster.yaml`): a tick that fires while a projection is still running waits for it instead of writing the same Iceberg files concurrently.
 
