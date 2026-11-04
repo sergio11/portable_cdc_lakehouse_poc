@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🧊 Portable CDC Lakehouse 🚀
+# 🧊 Portable CDC Lakehouse: A Reproducible Lambda Architecture for PostgreSQL CDC
 
 [![Java 21](https://img.shields.io/badge/Java-21-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://adoptium.net/)
 [![Apache Beam 2.76](https://img.shields.io/badge/Apache_Beam-2.76-F0772B?style=for-the-badge&logo=apachebeam&logoColor=white)](https://beam.apache.org/)
@@ -16,7 +16,7 @@
 [![Dagster 1.13](https://img.shields.io/badge/Dagster-1.13-FF6B00?style=for-the-badge&logo=dagster&logoColor=white)](https://dagster.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](#-license)
 
-### A local lambda architecture with Flink, Beam, Spark, Iceberg and Trino
+### One append-only Iceberg event log, a Flink SQL serving layer, a Spark authoritative batch layer, and read-only Trino — all on Podman
 
 Portable CDC Lakehouse is a local Proof of Concept for turning PostgreSQL changes into an auditable lakehouse with a **lambda architecture**: an append-only event log written by Flink, a serving table kept fresh in seconds, an authoritative batch layer that owns the current state, and a Trino endpoint that only reads committed tables.
 
