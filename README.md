@@ -42,6 +42,9 @@ The goal is to make the path from a relational database change to an auditable l
 
 The POC proves that machinery and leaves business rules as an explicit extension point: `silver` is where they belong, and the log already supports reprocessing them.
 
+For comprehensive information about this project, check out this [Medium article](https://medium.com/@sanchezsanchezsergio418/lambda-architecture-in-practice-building-an-auditable-cdc-lakehouse-from-postgresql-to-trino-c83465443164).
+
+
 ## ⚖️ Why this architecture
 
 PostgreSQL answers *what is the state now*. This POC also answers *how did it get here, and can I rebuild it*.
